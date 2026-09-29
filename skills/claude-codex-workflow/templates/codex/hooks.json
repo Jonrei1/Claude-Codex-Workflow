@@ -1,0 +1,27 @@
+{
+  "description": "Project hooks for graph health and automatic Claude verification after Codex turns.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Grep",
+        "hooks": [{ "type": "command", "command": "graphify hook-guard search" }]
+      },
+      {
+        "matcher": "Read|Glob",
+        "hooks": [{ "type": "command", "command": "graphify hook-guard read" }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const cp=require('node:child_process');const path=require('node:path');const root=cp.execFileSync('git',['rev-parse','--show-toplevel'],{encoding:'utf8'}).trim();require(path.join(root,'.codex','hooks','claude-verify.js'))\"",
+            "commandWindows": "node -e \"const cp=require('node:child_process');const path=require('node:path');const root=cp.execFileSync('git.exe',['rev-parse','--show-toplevel'],{encoding:'utf8'}).trim();require(path.join(root,'.codex','hooks','claude-verify.js'))\"",
+            "statusMessage": "Queueing Claude verification"
+          }
+        ]
+      }
+    ]
+  }
+}

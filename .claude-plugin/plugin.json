@@ -1,0 +1,10 @@
+{
+  "name": "claude-codex-workflow",
+  "version": "1.0.0",
+  "description": "Set up the Claude + Codex workflow (plan/implement roles, a Codex Stop hook that starts a background Claude verify run, graphify, Impeccable, caveman) in any project.",
+  "author": {
+    "name": "Jonrei",
+    "url": "https://github.com/Jonrei1"
+  },
+  "repository": "https://github.com/Jonrei1/Claude-Codex-Workflow"
+}

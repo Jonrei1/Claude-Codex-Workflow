@@ -1,0 +1,15 @@
+{
+  "name": "claude-codex-workflow",
+  "description": "Claude plans or implements, Codex implements, and a background Claude run checks and fixes Codex's work. graphify, Impeccable and caveman are wired in for both agents.",
+  "owner": {
+    "name": "Jonrei",
+    "url": "https://github.com/Jonrei1"
+  },
+  "plugins": [
+    {
+      "name": "claude-codex-workflow",
+      "source": "./",
+      "description": "Set up the Claude + Codex workflow (plan/implement roles, a Codex Stop hook that starts a background Claude verify run, graphify, Impeccable, caveman) in any project."
+    }
+  ]
+}
