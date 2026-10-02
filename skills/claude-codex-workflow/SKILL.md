@@ -23,7 +23,7 @@ A reusable setup for any project, new or existing, on any stack, on Windows, mac
 1. Check whether the project is new (no app code yet) or existing. Detect its stack from files at the repo root.
 2. Copy or merge the files from `templates/` in this skill's folder, as listed in [Templates](#templates).
    Never overwrite an existing `CLAUDE.md`, `AGENTS.md` or `.codex/hooks.json`. Merge sections and entries into them.
-3. Add `.codex/verify/`, `graphify-out/` and `plans/` to `.gitignore`. Always add `plans/`: plan files are local handoffs between Claude and Codex, not project history.
+3. Add `.codex/verify/`, `graphify-out/`, `plans/*` and `!plans/_template.md` to `.gitignore`. Always ignore `plans/*`: plan files are local handoffs between Claude and Codex, not project history. The template is the one exception, so every clone has it.
 4. Run `node .codex/hooks/claude-verify.js --print-checks` and show the result. If the list is wrong or empty, propose a `.codex/verify.json`.
 5. List the manual steps that are left for the user: `graphify claude install` and `graphify codex install`,
    `npx impeccable install --project`, and trusting the hooks in Codex. Then give the new- or existing-project steps from [Setup](#setup).
@@ -95,8 +95,10 @@ Per-OS notes:
    ```
    .codex/verify/
    graphify-out/
-   plans/
+   plans/*
+   !plans/_template.md
    ```
+   Use `plans/*`, not `plans/`: git can't re-include a file inside an ignored directory.
    Commit `PRODUCT.md`, `DESIGN.md`, `.impeccable/config.json` and `.impeccable/design.json`. Impeccable ignores its own local files (`config.local.json`, `live/…`).
 5. **Trust the hooks in Codex.** On the first Codex run in the project, Codex asks you to review and trust `.codex/hooks.json`. You can also approve them with `/hooks`. The trust is stored under `[hooks.state]` in `~/.codex/config.toml`. Any later edit to `hooks.json`, including Impeccable's install, means trusting it again.
 6. **Check the detected checks:** run `node .codex/hooks/claude-verify.js --print-checks`. If the list is wrong or empty, add `.codex/verify.json` (see [Checks](#checks)). You never edit the script for this.
@@ -147,6 +149,7 @@ These files are in `templates/`, next to this `SKILL.md`. Copy them into the tar
 | `AGENTS.codex.md` | `AGENTS.md` | Merge the `## Codex execution` section in. Make sure graphify's section ends with the once-per-task rule. |
 | `codex/hooks.json` | `.codex/hooks.json` | Merge its entries with any that are already there. Impeccable's installer adds its own entries next to them. |
 | `codex/hooks/claude-verify.js` | `.codex/hooks/claude-verify.js` | Copy it unchanged. |
+| `plans/_template.md` | `plans/_template.md` | Copy it. Every orchestrator plan starts from it. |
 | `skills/caveman/SKILL.md` | `.claude/skills/caveman/SKILL.md` and `.agents/skills/caveman/SKILL.md` | Copy it to both places. |
 
 About the hooks: the Stop hook starts the Claude check. The two PreToolUse hooks run graphify's guard, which steers Codex toward `graphify query`, `path` and `explain` before it falls back to grep or reads raw files. If `graphify` isn't on the PATH Codex sees, replace `graphify` with the full path, for example `C:/Users/<you>/.local/bin/graphify.EXE`.

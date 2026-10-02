@@ -5,16 +5,26 @@
   looks, and the answer holds for the rest of that task.
   - **Implement directly:** Claude edits the code itself, runs the checks below, and
     fixes failures.
-  - **Orchestrator (planner):** Claude doesn't edit app code. It writes the plan to
-    `plans/<short-task-name>.md` (objective, files, steps, edge cases, acceptance
-    criteria) and ends its reply with a ready-to-paste line for Codex, e.g.
-    `Execute plans/<short-task-name>.md`. The user reviews the plan and hands it off.
-    In plan mode, Claude also saves the approved plan to `plans/`, because the
-    plan-mode file lives outside the repo and Codex can't see it.
+  - **Orchestrator (planner):** Claude doesn't edit app code. It writes a phased plan
+    to `plans/<short-task-name>.md` (see **Plans** below) and ends its reply with a
+    ready-to-paste line for Codex, e.g. `Execute phase 1 of plans/<short-task-name>.md`.
+    The user reviews the plan and hands it off one phase at a time. In plan mode,
+    Claude also saves the approved plan to `plans/`, because the plan-mode file lives
+    outside the repo and Codex can't see it.
 
   Claude doesn't ask when the task only reads code, answers questions, or edits docs
   and config (`*.md`, `plans/`, `.claude/`, `.codex/`), or in the headless verify run
   below, which can't ask.
+- **Plans:** Orchestrator plans follow `plans/_template.md`.
+  - Phases are small enough to review as one diff. Prefer 3 to 6 phases.
+  - Every phase has a gate: a runnable command, not a description.
+  - Every phase has a commit message: `phase(<slug>): <N> <title>`.
+  - Backend phases list expected files and dependents from `graphify query`.
+  - UI phases name the Impeccable command to run, and the Playwright spec if the
+    project has one.
+  - Set `risk: high` in the frontmatter for schema, auth, payments, or cross-layer
+    contract changes. It switches the alignment review to Opus.
+  - Phases apply to orchestrator plans only. Implement-directly tasks don't use them.
 - **Verify:** Runs automatically. Codex's Stop hook (`.codex/hooks/claude-verify.js`)
   starts a headless Claude run (Sonnet, low effort) in the background when a Codex turn
   changed code. Claude reviews the diff against the plan, then runs the project's checks.
