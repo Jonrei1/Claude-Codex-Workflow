@@ -49,3 +49,35 @@
 Functional/manual testing stays with the user. Claude doesn't log in, drive the browser
 preview, or ask for credentials.
 
+### Closing a task
+
+When the user says "close <task>":
+1. Read `plans/<task>.md`, `.codex/verify/alignment.md`, and the phase commits
+   (`git log --oneline --grep "phase(<task>)"`).
+2. Write `docs/tasks/<YYYY-MM-DD>-<task>.md` from the template below. 25 lines max,
+   with real short SHAs.
+3. Fill "Deviations from the plan" by comparing the plan with the actual diff, not
+   from memory.
+4. Don't edit app code. Commit only the summary: `docs(tasks): <task>`.
+
+```md
+# <Task title>
+
+- Date: <YYYY-MM-DD>
+- Risk: normal | high
+- Plan reviewed by Codex: yes | no
+- Final verdict: PASS | PASS WITH NOTES
+
+## What shipped
+- Phase 1: <title> (<short sha>)
+
+## Deviations from the plan
+- <what changed and why, or "none">
+
+## Review findings that mattered
+- <Codex plan findings or alignment issues that changed the work, or "none">
+
+## Follow-ups
+- <deferred work, known gaps, or "none">
+```
+
