@@ -25,6 +25,13 @@
   - Set `risk: high` in the frontmatter for schema, auth, payments, or cross-layer
     contract changes. It switches the alignment review to Opus.
   - Phases apply to orchestrator plans only. Implement-directly tasks don't use them.
+  - **Optional Codex review:** set `review: codex` for a second opinion before any code
+    is written. It's on by default for `risk: high`, and skipped for small, low-risk
+    tasks. Claude saves a copy as `plans/.<slug>.orig.md`, then ends its reply with
+    `Review plans/<slug>.md` (to paste into a fresh Codex session) instead of the
+    execute line. Codex appends `## Codex Findings`. The user accepts or rejects them,
+    then starts with `Execute phase 1 of plans/<slug>.md`. Diffing against the `.orig`
+    copy shows that the original phases weren't changed.
 - **Verify:** Runs automatically. When a Codex turn changed code since the last
   verified commit (committed phases plus the working tree), Codex's Stop hook
   (`.codex/hooks/claude-verify.js`) starts two headless Claude runs in the background:

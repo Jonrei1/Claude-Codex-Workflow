@@ -20,6 +20,21 @@ so Codex doesn't need to run those unless the gate names them.
 - Do not change files outside the phase scope. If you need to, stop and report it.
 - Run `graphify update .` once at the end of the phase.
 - End your reply with: `Phase <N> done. Gate: <command> -> <pass/fail>.`
+- Treat accepted Codex Findings as part of the plan. Execute intermediate phases
+  (for example "Phase 2.5") in order.
+
+### Plan review (when asked "Review plans/<task>.md")
+
+- Do not edit or reorder existing phases.
+- Do not edit app code.
+- Append a section `## Codex Findings` at the end of the plan.
+- For each finding: the phase it affects, what is wrong or missing, evidence (file path
+  or graphify result), and a proposed fix.
+- If a phase needs a prerequisite step, propose an intermediate phase (for example
+  "Phase 2.5") inside the findings. Do not renumber existing phases.
+- Check specifically: files that do not exist, missed dependents (use `graphify query`),
+  missing test gates, unclear acceptance criteria, risky ordering.
+- End with: `PLAN REVIEW: APPROVE | CHANGES NEEDED`.
 
 For UI work, use the impeccable skill and follow `PRODUCT.md` and `DESIGN.md`. Run any
 impeccable command the plan names. Never commit impeccable's live-mode block
