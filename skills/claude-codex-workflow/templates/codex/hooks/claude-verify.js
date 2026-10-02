@@ -299,9 +299,13 @@ function context() {
   return { head, state, base, hash, files, plan, config, risk };
 }
 
+// Workflow state, not part of any phase: kept out of the diffs the reviewers read.
+const workflowPaths = ignored.filter((spec) => spec !== ":!*.md");
+
 function rangeText(ctx) {
-  const committed = ctx.base === ctx.head ? "no new commits" : `\`git diff ${ctx.base}..HEAD\``;
-  return `${committed}, plus uncommitted changes (\`git diff\` and \`git status\`)`;
+  const scope = `-- . ${workflowPaths.map((spec) => `'${spec}'`).join(" ")}`;
+  const committed = ctx.base === ctx.head ? "no new commits" : `\`git diff ${ctx.base}..HEAD ${scope}\``;
+  return `${committed}, plus uncommitted changes (\`git diff ${scope}\` and \`git status --short\`). Changes under plans/, .codex/, .claude/, .impeccable/ and graphify-out/ are workflow state: ignore them`;
 }
 
 function planLabel(ctx) {
@@ -444,11 +448,12 @@ function runVerification() {
     fs.writeFileSync(alignmentPath, `${header}${report}\n`);
   }
 
-  // Advance the verified commit only on PASS. Record the post-run state either way, so
-  // Claude's own fixes don't trigger another run on the next Stop.
+  // Advance the verified commit only on PASS; otherwise pin it to this run's base, so the
+  // same phase is reviewed again even after a non-phase fix commit. Record the post-run
+  // state either way, so Claude's own fixes don't trigger another run on the next Stop.
   const passed = verdict === "PASS";
   writeState({
-    verifiedSha: passed ? ctx.head : ctx.state.verifiedSha || "",
+    verifiedSha: passed ? ctx.head : ctx.base,
     fingerprint: changes(passed ? ctx.head : ctx.base).hash,
     lastVerdict: verdict || (stepA.error ? "NOT RUN" : "NEEDS REWORK"),
     lastPlan: planLabel(ctx),
