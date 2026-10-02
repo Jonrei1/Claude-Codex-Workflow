@@ -3,8 +3,10 @@
 A Claude Code plugin that sets up this workflow in any project, new or existing, on any stack, on Windows, macOS or Linux:
 
 - For each task, Claude asks whether to implement it directly or to act as orchestrator.
-- As orchestrator, Claude writes a plan to `plans/<task>.md` and Codex implements it.
-- When a Codex turn changes code, a Codex Stop hook starts a background Claude run (Sonnet, low effort). The run reviews the diff, runs the project's auto-detected checks, and fixes failures.
+- As orchestrator, Claude writes a phased plan to `plans/<task>.md`. Every phase has a runnable gate, and Codex implements one phase per turn with one commit per phase.
+- After each phase, a Codex Stop hook starts a background Claude run in two steps. Step A (Sonnet, low) runs the project's auto-detected checks and fixes only lint, formatting and type errors. Step B (Sonnet, medium; Opus for risky plans or paths) reviews the phase against the plan without editing, and ends with `VERDICT: PASS | NEEDS REWORK`.
+- Risky plans can get an optional Codex review before any code is written.
+- When the task is done, Claude writes a short committed summary to `docs/tasks/`.
 - graphify gives both agents a knowledge graph of the codebase.
 - [Impeccable](https://github.com/pbakaus/impeccable) gives both agents design skills and a hook that flags UI problems.
 - caveman keeps replies short when you want to save tokens.
@@ -32,6 +34,7 @@ skills/claude-codex-workflow/
     AGENTS.codex.md                # merge into AGENTS.md
     codex/hooks.json               # merge into .codex/hooks.json
     codex/hooks/claude-verify.js   # copy to .codex/hooks/claude-verify.js
+    plans/_template.md             # copy to plans/_template.md (phased plan template)
     skills/caveman/SKILL.md        # copy to .claude/skills/caveman/ and .agents/skills/caveman/
 ```
 
