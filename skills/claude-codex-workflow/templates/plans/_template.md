@@ -2,7 +2,6 @@
 task: <slug>
 risk: normal            # normal | high (schema, auth, payments, cross-layer contracts)
 review: none            # none | codex
-base: <commit sha or branch the work starts from>
 ---
 
 # <Task title>
@@ -23,14 +22,14 @@ One or two sentences. What changes for the user.
 **Scope:** files and interfaces
 **Steps:**
 1. ...
-**Gate (must pass before commit):**
+**Gate (must pass):**
 - `<runnable command, e.g. npx tsc --noEmit>`
-**Commit:** `phase(<slug>): 1 <title>`
+**Suggested commit (optional, for you):** `<type>(<slug>): <summary>`
 
 ## Phase 2: <title>
 **Scope:** ...
 **Steps:**
 1. ...
-**Gate (must pass before commit):**
+**Gate (must pass):**
 - `<command>`
-**Commit:** `phase(<slug>): 2 <title>`
+**Suggested commit (optional, for you):** `<type>(<slug>): <summary>`

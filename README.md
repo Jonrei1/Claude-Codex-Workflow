@@ -3,10 +3,12 @@
 A Claude Code plugin that sets up this workflow in any project, new or existing, on any stack, on Windows, macOS or Linux:
 
 - For each task, Claude asks whether to implement it directly or to act as orchestrator.
-- As orchestrator, Claude writes a phased plan to `plans/<task>.md`. Every phase has a runnable gate, and Codex implements one phase per turn with one commit per phase.
+- As orchestrator, Claude writes a phased plan to `plans/<task>.md`. Every phase has a runnable gate, and Codex implements one phase per turn.
 - After each phase, a Codex Stop hook starts a background Claude run in two steps. Step A (Sonnet, low) runs the project's auto-detected checks and fixes only lint, formatting and type errors. Step B (Sonnet, medium; Opus for risky plans or paths) reviews the phase against the plan without editing, and ends with `VERDICT: PASS | NEEDS REWORK`.
 - Risky plans can get an optional Codex review before any code is written.
-- When the task is done, Claude writes a short committed summary to `docs/tasks/`.
+- When the task is done, Claude writes a short summary to `docs/tasks/`.
+- No agent ever commits or pushes: every change stays in the working tree for you to review and commit.
+- **Autopilot:** once you approve a plan, `.codex/autopilot.js` runs every phase, its verification and rework, and the task summary on its own (`codex exec` plus headless Claude). Nothing is committed or pushed.
 - graphify gives both agents a knowledge graph of the codebase.
 - [Impeccable](https://github.com/pbakaus/impeccable) gives both agents design skills and a hook that flags UI problems.
 - caveman keeps replies short when you want to save tokens.
@@ -34,6 +36,8 @@ skills/claude-codex-workflow/
     AGENTS.codex.md                # merge into AGENTS.md
     codex/hooks.json               # merge into .codex/hooks.json
     codex/hooks/claude-verify.js   # copy to .codex/hooks/claude-verify.js
+    codex/hooks/workflow-lib.js    # copy to .codex/hooks/workflow-lib.js
+    codex/autopilot.js             # copy to .codex/autopilot.js
     plans/_template.md             # copy to plans/_template.md (phased plan template)
     skills/caveman/SKILL.md        # copy to .claude/skills/caveman/ and .agents/skills/caveman/
 ```

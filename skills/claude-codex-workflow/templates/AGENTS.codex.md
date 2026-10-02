@@ -4,22 +4,27 @@ Codex executes plans from `plans/<task>.md`. Read the whole plan first and follo
 its steps and acceptance criteria. If a step is wrong or impossible, stop and
 report it; do not silently diverge from the plan.
 
-After each phase, report the files changed. Codex runs the phase's gate. Claude
+After each phase, report the files changed. Never commit: the user commits by hand. Codex runs the phase's gate. Claude
 runs the project's full checks (typecheck, lint, build) afterward in the background,
 so Codex doesn't need to run those unless the gate names them.
 
 ### Phase execution
 
+- **Never run `git commit`, `git add`, `git stash` or `git push`.** The user commits by
+  hand. Leave every change in the working tree, including earlier phases' work and the
+  verify run's fixes.
 - Do exactly one phase per turn. Stop after it. Do not start the next phase.
 - Before editing, read only the files the phase lists. Use graphify for anything else.
-- If the working tree has uncommitted changes when you start, check
-  `.codex/verify/last.log`. If they are the verify run's fixes, commit them first as
-  `fix(<slug>): verify fixes after phase <N-1>`. If they aren't, stop and ask.
 - Run the phase gate. If it fails, fix it within the phase. If you cannot, stop and say why.
-- On a passing gate, commit with the phase's commit message. Do not amend earlier commits.
 - Do not change files outside the phase scope. If you need to, stop and report it.
+- When the phase is done, write `.codex/verify/phase.json` with
+  `{ "plan": "plans/<task>.md", "phase": "<N>" }`, so the verify run knows which phase
+  to review.
 - Run `graphify update .` once at the end of the phase.
 - End your reply with: `Phase <N> done. Gate: <command> -> <pass/fail>.`
+- **Autopilot runs** (the prompt says "Autopilot run"): skip `phase.json` and
+  `graphify update`. `.codex/autopilot.js` runs the gate and the verification, and
+  runs graphify at the end. Everything else above still applies.
 - Treat accepted Codex Findings as part of the plan. Execute intermediate phases
   (for example "Phase 2.5") in order.
 
