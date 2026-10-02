@@ -1,12 +1,13 @@
 ---
 name: claude-codex-workflow
 description: >
-  Set up the Claude + Codex workflow in a project, new or existing, on any stack. Claude either
-  implements tasks directly or writes phased plans for Codex. A Codex Stop hook starts a background
-  Claude run that checks Codex's work, fixes mechanical failures, and reviews each phase against the
-  plan without editing. graphify, Impeccable and caveman are wired in for both agents.
-  Use when the user asks to set up the Claude Codex workflow, add the Codex verify hook, set up the
-  orchestrator/Codex handoff, or install the caveman/graphify/Impeccable workflow in a project.
+  Set up the Claude + Codex workflow in a project, new or existing, on any stack, with one installer
+  that also installs Claude Code, the Codex CLI, graphify and Impeccable. Claude either implements
+  tasks directly or writes phased plans, then hands off with one pasted line (`Execute plans/<task>.md`)
+  that has Codex run every phase, with a headless Claude run checking and reviewing each one.
+  graphify, Impeccable and caveman are wired in for both agents.
+  Use when the user asks to set up or install the Claude Codex workflow, add the Codex verify hook,
+  set up the orchestrator/Codex handoff, or install the caveman/graphify/Impeccable workflow in a project.
 ---
 
 # Claude + Codex workflow
@@ -18,75 +19,81 @@ A reusable setup for any project, new or existing, on any stack, on Windows, mac
 - Risky plans can get an optional Codex review before any code is written.
 - When the task is done, Claude writes a short summary to `docs/tasks/`.
 - **No agent ever commits or pushes.** Every change stays in the working tree for you to review and commit. Progress is tracked with snapshots (git tree objects that aren't commits and aren't on any branch).
-- **Autopilot** (the default handoff) runs all of this unattended once you approve the plan: plan review, every phase with its gate, verify and rework, then the task summary.
+- **One-paste execution** (the default handoff): Claude always ends an approved plan with one line, `Execute plans/<task>.md`. Paste it into Codex once, and Codex runs the whole task: plan review, every phase with its gate, Claude verification and rework, then the task summary.
+- **One-command setup:** `scripts/install.js` (also `/claude-codex-workflow:setup` or `npx github:Jonrei1/Claude-Codex-Workflow`) installs the missing tools and wires everything into the project.
 - graphify gives both agents a knowledge graph of the codebase.
 - Impeccable gives both agents design skills (24 `/impeccable` commands) and a hook that flags UI problems after edits.
 - caveman keeps replies short when you want to save tokens.
 
 ## When invoked
 
-1. Check whether the project is new (no app code yet) or existing. Detect its stack from files at the repo root.
-2. Copy or merge the files from `templates/` in this skill's folder, as listed in [Templates](#templates).
-   Never overwrite an existing `CLAUDE.md`, `AGENTS.md` or `.codex/hooks.json`. Merge sections and entries into them.
-3. Create `docs/tasks/` (with a `.gitkeep`). Add `.codex/verify/`, `.codex/autopilot/`, `graphify-out/`, `plans/*` and `!plans/_template.md` to `.gitignore`. Always ignore `plans/*`: plan files are local handoffs between Claude and Codex, not project history. The template is the one exception, so every clone has it.
-4. Run `node .codex/hooks/claude-verify.js --print-checks` and show the result. If the list is wrong or empty, propose a `.codex/verify.json`. Also propose `alignment.riskPaths` for the project's schema, migration and auth paths (see [Checks](#checks)).
-5. List the manual steps that are left for the user: `graphify claude install` and `graphify codex install`,
-   `npx impeccable install --project`, and trusting the hooks in Codex. Then give the new- or existing-project steps from [Setup](#setup).
+1. Check whether the project is new (no app code yet) or existing, and that it's a git repo (`git init` if not, after asking).
+2. Run the installer from the project root: `node <this skill's folder>/scripts/install.js`. The installer can't prompt from a Claude session, so if it reports missing tools, show the install commands and ask before re-running with `--yes`. Use `--impeccable-providers=codex` when the Impeccable plugin is already enabled in Claude Code. If a workflow section already exists but differs, offer `--update-sections`.
+3. Show the summary, and fix by hand anything it couldn't merge (for example a `hooks.json` that isn't valid JSON). See [What the installer does](#what-the-installer-does).
+4. Read the checks it printed (`--print-checks`). If the list is wrong or empty, propose a `.codex/verify.json`. Also propose `alignment.riskPaths` for the project's schema, migration and auth paths (see [Checks](#checks)).
+5. List the steps left for the user (trusting the hooks in Codex, letting Codex's verify commands use the network), then the new- or existing-project steps from [Setup](#setup).
 
 ## Flow
 
 1. **Plan (you + Claude):** Describe the task. Before touching app code, Claude asks which role it should take. It asks even for small changes.
    - **Implement directly:** Claude edits the code itself and runs the project's checks. Skip steps 2-6.
-   - **Orchestrator (planner):** Claude only writes `plans/<task>.md` from `plans/_template.md`: frontmatter (`risk`, `review`), goal, graphify impact list, acceptance, then 3-6 phases. Each phase has a scope, steps, a runnable gate and, optionally, a suggested commit message for you. Claude ends its reply with `Execute phase 1 of plans/<task>.md`. It doesn't edit app code.
+   - **Orchestrator (planner):** Claude only writes `plans/<task>.md` from `plans/_template.md`: frontmatter (`risk`, `review`), goal, graphify impact list, acceptance, then 3-6 phases. Each phase has a scope, steps, a runnable gate and, optionally, a suggested commit message for you. Once you approve it, Claude runs `node .codex/autopilot.js check plans/<task>.md` and **always** ends its reply with the paste line in its own code block: `Execute plans/<task>.md`. It doesn't edit app code, and it doesn't start Codex or autopilot itself.
    - Claude doesn't ask for read-only questions or for doc/config-only edits (`*.md`, `plans/`, `.claude/`, `.codex/`).
    - **UI tasks:** Claude uses Impeccable (for example `/impeccable shape` to plan a screen). A UI plan names the Impeccable command Codex should run and the `DESIGN.md` sections it must follow.
-2. **Optional plan review (Codex):** for `review: codex` or `risk: high`, Claude ends with `Review plans/<task>.md` instead. Paste it into a **fresh** Codex session. Codex checks the plan against the codebase and appends `## Codex Findings`, without touching the phases. Accept or reject the findings, then start execution.
-3. **Handoff (you):** Review the plan, then paste `Execute phase 1 of plans/<task>.md` into Codex.
-4. **Implement one phase (Codex):** Codex does exactly one phase, runs its gate, writes `.codex/verify/phase.json` (which plan and phase it just did), runs `graphify update .`, and stops with `Phase N done. Gate: <command> -> pass`. It never commits. For UI work it uses the Impeccable skill, and Impeccable's hook flags design problems after each edit.
-5. **Automatic check (Codex Stop hook -> Claude):** When Codex's turn ends and the working tree changed since the last verified snapshot, two headless Claude runs start in the background, one after the other. Both read the change from `.codex/verify/phase.diff`:
+2. **Handoff (you):** Copy the line and paste it into Codex. That's the only paste: Codex runs the whole task, as described in [One-paste execution](#one-paste-execution). Steps 3 to 7 below describe the **manual** handoff (say "manual" to Claude), where you paste one phase at a time.
+3. **Manual: optional plan review (Codex):** for `review: codex` or `risk: high`, Claude ends with `Review plans/<task>.md` instead. Paste it into a **fresh** Codex session. Codex checks the plan against the codebase and appends `## Codex Findings`, without touching the phases. Accept or reject the findings, then paste `Execute phase 1 of plans/<task>.md`.
+4. **Manual: implement one phase (Codex):** Codex does exactly one phase, runs its gate, writes `.codex/verify/phase.json` (which plan and phase it just did), runs `graphify update .`, and stops with `Phase N done. Gate: <command> -> pass`. It never commits. For UI work it uses the Impeccable skill, and Impeccable's hook flags design problems after each edit.
+5. **Manual: automatic check (Codex Stop hook -> Claude):** When Codex's turn ends and the working tree changed since the last verified snapshot, two headless Claude runs start in the background, one after the other. Both read the change from `.codex/verify/phase.diff`:
    - **Step A, checks** (`sonnet`, effort `low`): runs the project's checks, auto-detected or listed in `.codex/verify.json` (see [Checks](#checks)). It fixes only lint, formatting and type errors, and reports every other failure. It reports, without removing, any Impeccable live-mode block. Report: `.codex/verify/last.log`.
    - **Step B, alignment** (`sonnet`, effort `medium`; `opus` when the plan has `risk: high` or the diff touches `alignment.riskPaths`): report-only, with `Edit` and `Write` denied. It lists DONE, PARTIAL, MISSING, OUT OF SCOPE, GATE and RISKS for the phase and ends with `VERDICT: PASS | NEEDS REWORK`. Report: `.codex/verify/alignment.md`.
    - The verified snapshot (`.codex/verify/state.json`) only advances on PASS, so a phase that needs rework is reviewed again on the next run. When you commit, HEAD becomes the new starting point.
-6. **Result (you):** Read `last.log` (it ends with `Finished` and the verdict) and `alignment.md`. On NEEDS REWORK, send the findings back to Codex. On PASS, paste the next phase. Commit whenever you like: after each phase, or once at the end.
-7. **Close (you + Claude):** Say `close <task>`. Claude reads the plan, `alignment.md` and the diff, and writes `docs/tasks/<YYYY-MM-DD>-<task>.md` (25 lines max). You commit it with the work.
+6. **Manual: result (you):** Read `last.log` (it ends with `Finished` and the verdict) and `alignment.md`. On NEEDS REWORK, send the findings back to Codex. On PASS, paste the next phase. Commit whenever you like: after each phase, or once at the end.
+7. **Manual: close (you + Claude):** Say `close <task>`. Claude reads the plan, `alignment.md` and the diff, and writes `docs/tasks/<YYYY-MM-DD>-<task>.md` (25 lines max). You commit it with the work.
 
-## Autopilot
+## One-paste execution
 
-With autopilot, steps 2 to 7 above run without any pastes. After you approve the plan, Claude starts the driver in the background:
+After you approve a plan, Claude ends its reply with this line, in its own code block:
 
 ```
-node .codex/autopilot.js plans/<slug>.md            # run everything
-node .codex/autopilot.js plans/<slug>.md --dry-run  # parse and validate only
-node .codex/autopilot.js plans/<slug>.md --resume   # continue after a stop
+Execute plans/<slug>.md
 ```
 
-What the driver does:
+Paste it into Codex once. Codex follows AGENTS.md "Full plan execution" and runs the whole task in that session, calling `.codex/autopilot.js` for everything that isn't implementation:
 
-1. **Preflight.** It validates the plan (every phase needs a real gate command) and takes a snapshot of the working tree. Uncommitted changes you already had become part of that starting snapshot, so they aren't reviewed as the task's work.
+```
+node .codex/autopilot.js check  plans/<slug>.md       # validate (every phase needs a real gate)
+node .codex/autopilot.js begin  plans/<slug>.md       # starting snapshot, status "running"
+node .codex/autopilot.js triage plans/<slug>.md       # Claude triages Codex's plan findings
+node .codex/autopilot.js phase  plans/<slug>.md <N>   # snapshot the phase's starting tree
+node .codex/autopilot.js verify plans/<slug>.md <N>   # gate, then Step A + Step B
+node .codex/autopilot.js close  plans/<slug>.md       # graphify update + task summary
+```
+
+What happens:
+
+1. **Preflight.** `check` validates the plan. `begin` snapshots the working tree. Uncommitted changes you already had become part of that starting snapshot, so they aren't reviewed as the task's work.
 2. **Plan review**, for `review: codex` or `risk: high`.
-   - `codex exec` appends `## Codex Findings`.
-   - The driver checks that the phases above the findings weren't changed.
-   - A headless Claude run (Sonnet, medium effort) marks each finding ACCEPTED or REJECTED and folds the accepted ones into the plan. It can only edit that plan file.
+   - Codex appends `## Codex Findings`, following "Plan review".
+   - `triage` checks that the phases above the findings weren't changed. Then a headless Claude run (Sonnet, medium effort) marks each finding ACCEPTED or REJECTED and folds the accepted ones into the plan. It can only edit that plan file.
 3. **Each phase:**
-   - The driver snapshots the working tree.
-   - `codex exec -s workspace-write` implements the phase.
-   - The driver runs the gate. On failure, Codex gets one fix attempt with the gate output.
-   - The driver runs `claude-verify.js --run` against the phase's starting snapshot (Step A, then Step B).
-   - On NEEDS REWORK, Codex gets `alignment.md` and reworks, up to 2 attempts, each verified again.
-4. **Close.**
-   - It runs `graphify update .`.
-   - A headless Claude run (Sonnet, low effort) writes `docs/tasks/<date>-<slug>.md`. It can only write that file.
+   - `phase N` snapshots the working tree, then Codex implements the phase.
+   - `verify N` runs the gate. If it fails (exit 2), Codex fixes it and runs `verify` again.
+   - Then it runs `claude-verify.js --run` against the phase's starting snapshot (Step A, then Step B) and prints the verdict.
+   - On NEEDS REWORK (exit 3), the output includes `alignment.md`. Codex reworks and runs `verify` again, up to 2 times. A third NEEDS REWORK stops the run as `stuck` (exit 4).
+4. **Close.** `close` runs `graphify update .`, then a headless Claude run (Sonnet, low effort) writes `docs/tasks/<date>-<slug>.md`. It can only write that file. Codex ends with `Task <slug> done. Review and commit the changes.`
 
-Nothing is committed, staged or pushed at any point. When the run is done, review the working tree and commit it yourself, in one commit or per phase (each phase may suggest a message). Progress is in `.codex/autopilot/status.json` (`running`, `done`, `stuck` or `failed`, with the phase, step and reason). The step-by-step log is `.codex/autopilot/<slug>.log`, and each Codex and Claude call saves its output next to it. A Windows balloon notification (or a terminal bell elsewhere) fires when the run ends.
+Nothing is committed, staged or pushed at any point. When the run is done, review the working tree and commit it yourself, in one commit or per phase (each phase may suggest a message). Progress is in `.codex/autopilot/status.json` (`running`, `done`, `stuck` or `failed`, with the phase, step and reason). The step-by-step log is `.codex/autopilot/<slug>.log`. A Windows balloon notification (or a terminal bell elsewhere) fires when the run ends or stops.
 
-- **`stuck`** means a decision is needed: a phase still fails review after 2 reworks, or Codex changed the plan during review. Read `alignment.md`, fix the plan or the code, then run `--resume`.
-- **`failed`** means a step broke: a gate that still fails after a fix, a Codex or Claude call that crashed or timed out (30 minutes per call), or a git error. Fix the cause, then run `--resume`.
-- While autopilot runs, the Codex Stop hook stays quiet (`CODEX_AUTOPILOT=1`), because the driver verifies each phase itself.
-- Manual handoff still works. Say "manual" when Claude finishes the plan, and paste the phases yourself as in the Flow above.
+- **`stuck`** means a decision is needed: a phase still fails review after 2 reworks, or the plan changed during review. Read `alignment.md`, fix the plan or the code (or ask Claude to), then tell Codex to continue. It runs the step that stopped again.
+- **`failed`** means a step broke: a Claude call that didn't start, crashed or timed out (30 minutes per call), or a git error. Fix the cause, then tell Codex to continue.
+- `verify`, `triage` and `close` start headless Claude runs. Inside Codex they need network access and a long command timeout. Approve them when Codex asks to run them outside the sandbox.
+- While a Codex-driven run is unfinished (`running`, `stuck` or `failed`), the Codex Stop hook stays quiet, because `verify` does the checking.
+- **Manual handoff** still works. Say "manual" when Claude finishes the plan, and paste the phases yourself as in the Flow above.
+- **Unattended fallback:** `node .codex/autopilot.js run plans/<slug>.md [--resume] [--force]` does the same loop without an open Codex session: the driver calls `codex exec -s workspace-write` for each phase, gate fix and rework itself (`CODEX_AUTOPILOT=1` keeps the Stop hook quiet). Each Codex and Claude call saves its output next to the log.
 
 Rules of thumb:
 
-- Wait for `Finished` in the log before starting another Codex turn, so two agents don't edit the same files. A run is two Claude calls, so it takes longer than a plain check.
+- In a manual handoff, wait for `Finished` in the log before starting another Codex turn, so two agents don't edit the same files. A run is two Claude calls, so it takes longer than a plain check.
 - Some turns don't trigger a check:
   - turns that change only `plans/`, `.codex/`, `.claude/`, `.impeccable/`, `graphify-out/` or `*.md`
   - a state that was already verified (including a NEEDS REWORK state that hasn't changed since)
@@ -98,66 +105,68 @@ Rules of thumb:
 
 ## Setup
 
-### Requirements
+### One command
 
-| Tool | Install | Notes |
+Run one of these from the project root (it must be a git repo):
+
+```
+/claude-codex-workflow:setup                                   # in Claude Code, with the plugin
+npx github:Jonrei1/Claude-Codex-Workflow                       # anywhere, no plugin needed
+node <skill folder>/scripts/install.js                         # from a copy of this skill
+```
+
+Flags: `--yes` (install missing global tools without asking), `--dry-run`, `--tools-only`, `--project-only`, `--update-sections`, `--impeccable-providers=codex`, `--skip-graphify`, `--skip-impeccable`, `--root <dir>`. Re-running is safe: it skips what's already there and upgrades the `.codex/` scripts to the plugin's version.
+
+### What the installer does
+
+**Tools.** It checks each one and installs it if it's missing. Global installs ask first (in a terminal) or need `--yes`.
+
+| Tool | Install if missing | Notes |
 |---|---|---|
-| Node and git | your OS package manager | Node runs the verify hook on every OS. |
-| Claude Code CLI | `claude` on PATH | The verify hook calls it headless. |
-| Codex | CLI or app | Autopilot needs the `codex` CLI on PATH, logged in (`codex login status`). |
-| graphify | `uv tool install graphifyy` (or `pip install graphifyy`) | Gives you the `graphify` command. |
-| Impeccable | `npx impeccable install` (see step 3) | After install it runs a self-contained binary, so no Node is needed at runtime. Claude Code can use the Impeccable plugin instead (user level, covers every project). |
+| Node 18+ and git | your OS package manager (not automatic) | Node runs the hooks and the helper on every OS. |
+| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` | The verify step calls it headless. |
+| Codex CLI | `npm install -g @openai/codex` | Then `codex login` if `codex login status` fails. |
+| graphify | `uv tool install graphifyy`, else `pipx install graphifyy`, else `pip install --user graphifyy` | If it lands outside PATH, the installer uses its full path. |
+| Impeccable | nothing global | Runs through `npx`. Claude Code can use the Impeccable plugin instead (then pass `--impeccable-providers=codex`). |
+
+**Project.** It never overwrites `CLAUDE.md`, `AGENTS.md` or `.codex/hooks.json`; it merges into them.
+
+1. Copies `.codex/hooks/claude-verify.js`, `.codex/hooks/workflow-lib.js` and `.codex/autopilot.js` (always the plugin's version).
+2. Creates `plans/_template.md`, the caveman skill in `.claude/skills/caveman/` and `.agents/skills/caveman/`, and `docs/tasks/.gitkeep`, if they're missing.
+3. Appends the `## Workflow` section to `CLAUDE.md` and the `## Codex execution` section to `AGENTS.md`. If a section exists and differs, it says so; `--update-sections` replaces it.
+4. Adds the verify and graphify hooks to `.codex/hooks.json`, keeping every existing entry.
+5. Adds `.codex/verify/`, `.codex/autopilot/`, `graphify-out/`, `plans/*` and `!plans/_template.md` to `.gitignore`. Plans are local handoffs, not history; `plans/*` (not `plans/`) lets the template be re-included.
+6. Runs `graphify claude install` and `graphify codex install`, then makes sure both files end with the once-per-task graphify rule.
+7. Runs `npx -y impeccable install --project --providers=claude,codex`, then re-adds the verify and graphify hooks if Impeccable's merge dropped them. Impeccable writes its own local-state ignores to `.git/info/exclude`.
+8. Prints the detected checks (`node .codex/hooks/claude-verify.js --print-checks`).
+
+### Left for you
+
+1. **Trust the hooks in Codex.** On the first Codex run in the project, Codex asks you to review and trust `.codex/hooks.json`, or approve them with `/hooks`. The trust is stored under `[hooks.state]` in `~/.codex/config.toml`. Any later edit to `hooks.json` means trusting it again.
+2. **Let the verify step run from Codex.** `autopilot.js verify`, `triage` and `close` start headless Claude runs, which need the network and several minutes. Approve them when Codex asks to run them outside the sandbox.
+3. If the detected checks are wrong or empty, add `.codex/verify.json` (see [Checks](#checks)). You never edit the script for this.
+4. Commit `PRODUCT.md`, `DESIGN.md`, `.impeccable/config.json` and `.impeccable/design.json` when they exist.
+5. Keep `.claude/settings.json` free of hooks that block Claude from editing code. Impeccable's Claude hook only reports findings; it doesn't block.
+6. **Optional: tune the models.** Step B's model, effort and risk model come from the `alignment` block in `.codex/verify.json` (see [Checks](#checks)). Step A's `--model sonnet --effort low` is in `claude-verify.js`.
 
 Per-OS notes:
-- **Windows:** Codex runs `commandWindows` from `hooks.json`. If `graphify` isn't on the PATH Codex sees, use its full path (for example `C:/Users/<you>/.local/bin/graphify.EXE`). Impeccable's launcher is `impeccable.cmd`. If `npm run build` fails under Bash with `0xc0000142`, run it under PowerShell. The verify hook already allows PowerShell for its checks on Windows.
+- **Windows:** Codex runs `commandWindows` from `hooks.json`. Impeccable's launcher is `impeccable.cmd`. If `npm run build` fails under Bash with `0xc0000142`, run it under PowerShell. The verify hook already allows PowerShell for its checks on Windows.
 - **macOS and Linux:** Codex runs `command`. Impeccable's launcher is the `impeccable` shell script. File names are case-sensitive on Linux, so use `DESIGN.md` and `PRODUCT.md` exactly.
-
-### Steps for every project
-
-1. **Add the files from [Templates](#templates).** These are the `CLAUDE.md` and `AGENTS.md` sections, `.codex/hooks.json`, `.codex/hooks/claude-verify.js`, and the caveman skill. Put the caveman skill in both of these, so both agents get it:
-   - `.claude/skills/caveman/SKILL.md`
-   - `.agents/skills/caveman/SKILL.md`
-
-   In an existing project, **merge** these sections into the `CLAUDE.md`, `AGENTS.md` and `.codex/hooks.json` you already have. Don't overwrite them.
-2. **Install graphify for both agents** by running these in the project root:
-   ```
-   graphify claude install   # graphify section in CLAUDE.md + Claude Code PreToolUse hook
-   graphify codex install    # graphify section in AGENTS.md
-   ```
-   `graphify claude install` appends its own graphify section to `CLAUDE.md`. Change its last rule to the once-per-task rule at the end of `templates/AGENTS.codex.md`.
-3. **Install Impeccable for both agents.** Run this in the project root:
-   ```
-   npx impeccable install --project
-   ```
-   Choose Claude Code and Codex, or pass `--providers=<names>`. If you already use the Impeccable plugin in Claude Code, install only for Codex, so Claude doesn't load the skill twice. The installer adds the skill (Codex reads it from `.agents/skills/`) and merges its hooks into `.codex/hooks.json` next to the ones from step 1. Diff `hooks.json` afterward, and restore the verify and graphify entries if they're missing. Impeccable writes its own local-state ignores to `.git/info/exclude`.
-4. **Update `.gitignore`.** Add:
-   ```
-   .codex/verify/
-   .codex/autopilot/
-   graphify-out/
-   plans/*
-   !plans/_template.md
-   ```
-   Use `plans/*`, not `plans/`: git can't re-include a file inside an ignored directory.
-   Commit `PRODUCT.md`, `DESIGN.md`, `.impeccable/config.json` and `.impeccable/design.json`. Impeccable ignores its own local files (`config.local.json`, `live/…`).
-5. **Trust the hooks in Codex.** On the first Codex run in the project, Codex asks you to review and trust `.codex/hooks.json`. You can also approve them with `/hooks`. The trust is stored under `[hooks.state]` in `~/.codex/config.toml`. Any later edit to `hooks.json`, including Impeccable's install, means trusting it again.
-6. **Check the detected checks:** run `node .codex/hooks/claude-verify.js --print-checks`. If the list is wrong or empty, add `.codex/verify.json` (see [Checks](#checks)). You never edit the script for this.
-7. Keep `.claude/settings.json` free of hooks that block Claude from editing code. Impeccable's Claude hook only reports findings; it doesn't block.
-8. **Optional: tune the models.** Step B's model, effort and risk model come from the `alignment` block in `.codex/verify.json` (see [Checks](#checks)). Step A's `--model sonnet --effort low` is in `claude-verify.js`.
 
 ### New project
 
-1. Scaffold the app first, so there's a stack for the checks to detect. Then do the steps above.
+1. Scaffold the app first, so there's a stack for the checks to detect. Then run the installer.
 2. Run `/impeccable init` in Claude Code. It interviews you and writes `PRODUCT.md`.
 3. Once there's code, build the first graph with `/graphify .` in Claude Code. After that, `graphify update .` keeps it current; it reads the code only and makes no API calls.
 4. `DESIGN.md` comes from Impeccable after the first visual build, or run `/impeccable document` later.
 
 ### Existing project
 
-1. Do the steps above, merging into the files that are already there.
+1. Run the installer. It merges into the files that are already there.
 2. Build the graph with `/graphify .` in Claude Code.
 3. Run `/impeccable init` to write `PRODUCT.md`, then `/impeccable document` to capture the current design system in `DESIGN.md`. If the project already had an older Impeccable setup, run `/impeccable doctor` instead to bring it up to date.
 4. If the repo already has UI conventions in another file, merge them into `DESIGN.md`, or point `CLAUDE.md` and `AGENTS.md` at that file.
+5. Upgrading from an earlier version of this workflow: re-run the installer with `--update-sections` so `CLAUDE.md` and `AGENTS.md` get the one-paste handoff.
 
 ## Checks
 
@@ -196,11 +205,11 @@ The optional `alignment` block in `.codex/verify.json` configures Step B. Every 
 
 Step B switches to `riskModel` when the active plan's frontmatter says `risk: high`, or when a changed file matches a `riskPaths` glob (`**` for any depth, `*` and `?` within a path segment). A `verify.json` with only an `alignment` block keeps the auto-detected checks.
 
-The active plan and phase come from `.codex/verify/phase.json`, which Codex writes after a phase (autopilot passes them directly). Without it, the most recently edited plan is used, and Step B infers the phase. `--print-checks` shows the resolved range, plan, phase and model.
+The active plan and phase come from `.codex/verify/phase.json`, which Codex writes after a phase (`autopilot.js verify` passes them directly). Without it, the most recently edited plan is used, and Step B infers the phase. `--print-checks` shows the resolved range, plan, phase and model.
 
 ## Templates
 
-These files are in `templates/`, next to this `SKILL.md`. Copy them into the target project, or merge them where a file already exists.
+These files are in `templates/`, next to this `SKILL.md`. `scripts/install.js` copies or merges them for you; this table is what it does, for doing it by hand.
 
 | Template | Destination in the project | How |
 |---|---|---|
@@ -221,11 +230,16 @@ Also create an empty `docs/tasks/` folder (with a `.gitkeep`) for the task summa
 
 ## Troubleshooting
 
-- **Autopilot says another run holds the lock:** `.codex/autopilot/running.lock` is left over from a run that was killed. If no run is going, pass `--force` or delete the file.
+- **The installer says a tool is missing but doesn't install it:** It only installs global tools after asking in a terminal, or with `--yes`. From Claude, re-run with `--yes`.
+- **The installer says a section "exists and differs":** The project has an older `## Workflow` or `## Codex execution` section. Re-run with `--update-sections` to replace just that section.
+- **`verify` fails inside Codex with `Failed to start claude` or a network error:** The Codex sandbox blocked the headless Claude run. Approve running the command outside the sandbox, and make sure `claude` is on the PATH Codex sees.
+- **Codex's `verify` command gets cut off:** Its shell timeout is shorter than the Claude run. Ask Codex to run it with a 30-minute timeout; it's safe to run `verify` again for the same phase.
+- **`begin` says another run is still marked running:** `.codex/autopilot/status.json` is left over from a run that never finished. If no run is going, pass `--force`.
+- **Unattended `run` says another run holds the lock:** `.codex/autopilot/running.lock` is left over from a run that was killed. If no run is going, pass `--force` or delete the file.
 - **Your own edits got mixed into an autopilot phase:** Edits you make while autopilot runs land in the phase's diff and can fail review. Leave the working tree alone until the run is done.
-- **Autopilot stops with `codex ... exited`:** Open the matching `.codex/autopilot/<slug>.codex.*.out.log`. Common causes: `codex` isn't logged in, or the workspace-write sandbox blocked a command the phase needs.
+- **Unattended `run` stops with `codex ... exited`:** Open the matching `.codex/autopilot/<slug>.codex.*.out.log`. Common causes: `codex` isn't logged in, or the workspace-write sandbox blocked a command the phase needs.
 
-- **No log appears:** Either the Codex hooks aren't trusted or enabled (see setup step 5), or the working tree had no code changes.
+- **No log appears:** Either the Codex hooks aren't trusted or enabled (see [Left for you](#left-for-you)), or the working tree had no code changes.
 - **The log says `Failed to start claude`:** `claude` isn't on the PATH that Codex sees.
 - **The log lists the wrong checks, or none:** Run `node .codex/hooks/claude-verify.js --print-checks` to see what's detected, then add `.codex/verify.json`.
 - **A check fails with `0xc0000142` on Windows:** Bash couldn't start a child process. The verify run retries under PowerShell. Run the check yourself in PowerShell to confirm.

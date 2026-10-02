@@ -25,7 +25,8 @@
 // riskPaths. `node .codex/hooks/claude-verify.js --print-checks [--root <dir>]` prints
 // the resolved setup without starting a run. `--run [--base <tree>] [--plan <path>]
 // [--phase <id>]` verifies synchronously; .codex/autopilot.js uses it after each phase.
-// Under autopilot (CODEX_AUTOPILOT=1) the Stop hook itself does nothing.
+// Under autopilot (CODEX_AUTOPILOT=1, or .codex/autopilot/status.json says "running")
+// the Stop hook itself does nothing.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -183,6 +184,19 @@ function readState() {
 
 function writeState(state) {
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
+}
+
+// An unfinished autopilot run verifies each phase itself. A Codex-driven run
+// (`Execute plans/<task>.md`) that stopped as stuck or failed is resumed by rerunning
+// its step, so it stays quiet too.
+function autopilotActive() {
+  try {
+    const status = JSON.parse(readFile(path.join(repoRoot, ".codex", "autopilot", "status.json")));
+    const states = status.driver === "codex" ? ["running", "stuck", "failed"] : ["running"];
+    return states.includes(status.state) && Date.now() - Date.parse(status.updated) < 6 * 60 * 60 * 1000;
+  } catch {
+    return false;
+  }
 }
 
 function newestPlan() {
@@ -420,7 +434,7 @@ if (process.argv.includes("--print-checks")) {
 } else if (process.argv.includes("--run")) {
   runVerification();
   emitHookResult();
-} else if (process.env.CODEX_AUTOPILOT === "1") {
+} else if (process.env.CODEX_AUTOPILOT === "1" || autopilotActive()) {
   // Autopilot runs verification itself after each phase; don't start an overlapping run.
   emitHookResult();
 } else {

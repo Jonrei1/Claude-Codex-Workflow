@@ -9,7 +9,7 @@
     {
       "name": "claude-codex-workflow",
       "source": "./",
-      "description": "Set up the Claude + Codex workflow (plan/implement roles, a Codex Stop hook that starts a background Claude verify run, graphify, Impeccable, caveman) in any project."
+      "description": "Set up the Claude + Codex workflow in any project with one command (/claude-codex-workflow:setup installs Claude Code, Codex CLI, graphify and Impeccable). Claude plans; one pasted line has Codex run every phase with background Claude verification."
     }
   ]
 }
