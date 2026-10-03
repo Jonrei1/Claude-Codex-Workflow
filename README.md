@@ -1,72 +1,272 @@
 # Claude + Codex workflow
 
-A Claude Code plugin that sets up this workflow in any project, new or existing, on any stack, on Windows, macOS or Linux:
+A Claude Code plugin and standalone installer that gives Claude and Codex a shared way to plan, implement, verify and document work in a Git project. One setup command installs missing tools, including **Playwright MCP and Chromium**, and adds project instructions and execution helpers.
 
-- **One-command setup:** one installer installs the missing tools (Claude Code, the Codex CLI, graphify, Impeccable) and wires the workflow into the project.
-- For each task, Claude asks whether to implement it directly or to act as orchestrator.
-- As orchestrator, Claude writes a phased plan to `plans/<task>.md`. Every phase has a runnable gate.
-- **One-paste execution:** Claude always ends an approved plan with one line, `Execute plans/<task>.md`. Paste it into Codex, and Codex runs every phase: it implements, then `.codex/autopilot.js verify` runs the gate and a headless Claude check. Codex reworks on findings, and the run ends with a task summary in `docs/tasks/`.
-- Each check has two steps. Step A (Sonnet, low) runs the project's auto-detected checks and fixes only lint, formatting and type errors. Step B (Sonnet, medium; Opus for risky plans or paths) reviews the phase against the plan without editing, and ends with `VERDICT: PASS | NEEDS REWORK`.
-- Risky plans get a Codex plan review, triaged by Claude, before any code is written.
-- No agent ever commits or pushes: every change stays in the working tree for you to review and commit.
-- graphify gives both agents a knowledge graph of the codebase.
-- [Impeccable](https://github.com/pbakaus/impeccable) gives both agents design skills and a hook that flags UI problems.
-- caveman keeps replies short when you want to save tokens.
+## What this setup is for
 
-## Install
+The purpose is to make an AI coding task concrete and reviewable: agree on what should change, divide it into phases with executable checks, implement each phase, and compare the result against the approved plan. Shared files carry the requirements between Claude and Codex, so you can hand off a task with one pasted line instead of repeatedly explaining it.
+
+Claude can implement a task directly, or act as planner while Codex implements. In the orchestrated workflow, separate headless Claude runs check each phase's code and alignment with the plan. This adds a second review pass and a record of findings. It also adds model usage and time; choose direct implementation when that overhead is unnecessary.
+
+The workflow supports new or existing repositories and detects checks for several stacks. Browser tooling has its own platform requirements. You control the final changes: agents do not commit, stage, stash or push your work. You review and commit it yourself.
+
+## How the tools help
+
+| Tool | Role in this setup | Benefit |
+|---|---|---|
+| Claude Code | Interactive planner or implementer; headless checker, reviewer and summary writer | Turns a request into acceptance criteria and phases, then checks whether the implementation satisfies them. |
+| Codex CLI | Implements approved phases, runs gates and fixes findings | Carries a task through every phase from one handoff; optional plan review checks assumptions before implementation. |
+| Playwright MCP + Chromium | Browser tools available to both agents | Enables requested inspection of a running app: navigation, clicks, forms, browser errors, screenshots and different viewport sizes. |
+| graphify | Shared codebase knowledge graph and search/read hooks | Helps find affected modules and dependents before editing, so plans include relevant files and checks. |
+| Impeccable | Design skills and UI feedback hooks | Uses `PRODUCT.md` and `DESIGN.md` to guide UI work and flag design issues during implementation. |
+| caveman | Optional terse replies | Reduces prose output; file reads, reasoning, tool results and reviews still consume usage. No fixed percentage saving is guaranteed. |
+| Autopilot helper and verification hook | Local Node scripts under `.codex/` | Track snapshots, run gates, launch reviews, record verdicts and close tasks. The scripts coordinate agents; they are not another model. |
+
+For example, for a checkout-page change, Claude can identify dependencies with graphify and specify the design using Impeccable. Codex implements the phases and uses Playwright to check requested interactions in the running app. Gates run executable assertions, and Claude reviews the diff against the plan.
+
+## Install once, configure each project
+
+### Prerequisites
+
+- Node.js and npm, with `npx` available. The installer requires Node 18+, but **use a current supported Node LTS for browser tooling**; current Playwright Test documentation lists Node 22/24/26.
+- Git and a repository for project setup. Scaffold a new app and run `git init` yourself before setup.
+- Claude and Codex accounts or supported API authentication. Installing the CLIs does not sign you in or include model usage.
+- `uv`, `pipx`, or Python if graphify needs installing.
+
+Use a supported operating system for browser tooling. See the official [Playwright installation requirements](https://playwright.dev/docs/intro#system-requirements) for the current platform list.
+
+### Through the Claude Code plugin
 
 In Claude Code:
 
-```
+```text
 /plugin marketplace add Jonrei1/Claude-Codex-Workflow
 /plugin install claude-codex-workflow@claude-codex-workflow
 ```
 
-Then, in the project you want to set up (a git repo):
+Open the target project and run:
 
-```
-/claude-codex-workflow:setup
-```
-
-Or without the plugin, from the project root:
-
-```
-npx github:Jonrei1/Claude-Codex-Workflow
+```text
+/claude-codex-workflow:setup --yes
 ```
 
-Useful flags: `--yes` (install missing global tools without asking), `--dry-run`, `--project-only`, `--update-sections` (refresh the `CLAUDE.md`/`AGENTS.md` sections after an upgrade), `--impeccable-providers=codex` (if you already use the Impeccable plugin in Claude Code).
+`--yes` approves missing global tool installations, Chromium download and missing Playwright MCP registrations. Without it, a terminal installer prompts. A headless Claude command cannot prompt and reports incomplete steps for you to address.
 
-After setup, trust `.codex/hooks.json` in Codex (`/hooks`), and let Codex run `node .codex/autopilot.js verify|triage|close` outside the sandbox when it asks: those start headless Claude runs.
+### Without the plugin
 
-## Daily use
+From the target Git project root:
 
-1. Describe the task to Claude, and choose **Orchestrator**.
-2. Approve the plan. Claude ends with:
-   ```
+```sh
+npx github:Jonrei1/Claude-Codex-Workflow --yes
+```
+
+To inspect intended changes without installing or writing anything:
+
+```sh
+npx github:Jonrei1/Claude-Codex-Workflow --dry-run
+```
+
+The machine tools are shared across projects. Run full setup once on each development machine, then run setup in every repository that should use the workflow. Once the tools and browser registrations are ready, use `--project-only` in additional projects to skip machine setup.
+
+### What the installer does
+
+| Step | Action | Location |
+|---|---|---|
+| Prerequisites | Checks Node and Git; reports missing prerequisites rather than installing them | Your machine |
+| Agent CLIs | Installs missing `@anthropic-ai/claude-code` and `@openai/codex` through npm | Global npm packages |
+| Playwright | Installs missing `@playwright/mcp`, locates its bundled Playwright dependency, and downloads matching Chromium if absent | Global npm package and user browser cache |
+| Browser connections | Adds missing `playwright` MCP registrations for Claude in user scope and Codex in user config | `~/.claude.json` and `~/.codex/config.toml`, shared across projects |
+| graphify | Installs with `uv`, then `pipx`, then user-level Python pip as available | Your machine |
+| Helpers | Copies or updates workflow-owned Node scripts | `.codex/autopilot.js` and `.codex/hooks/` |
+| Instructions and hooks | Merges workflow sections and hook groups, retaining existing entries | `CLAUDE.md`, `AGENTS.md`, `.codex/hooks.json` |
+| Templates and skills | Creates missing plan template, task directory and caveman skills | `plans/`, `docs/tasks/`, `.claude/skills/`, `.agents/skills/` |
+| Project integrations | Runs graphify's agent installers and `npx -y impeccable install --project --providers=claude,codex` | Project instructions, design skills and hooks |
+| Ignores and checks | Adds workflow-state ignores and prints detected verification commands | `.gitignore` and installer output |
+
+Re-running updates workflow-owned `.codex/` scripts. Existing instruction sections are retained unless you pass `--update-sections`; existing customized plan and caveman templates are kept. Existing Playwright registrations are preserved and matching Chromium is reused. Keeping an existing registration does not prove it connects successfully; check `/mcp`.
+
+### Flags
+
+| Flag | Effect |
+|---|---|
+| `--yes` | Approve missing machine tools and Playwright setup without installer prompts. |
+| `--dry-run` | Print intended actions without installing or writing files/configuration. |
+| `--tools-only` | Set up machine tools, Chromium and Playwright registrations; skip project files and integrations. |
+| `--project-only` | Configure the project using existing tools; skip machine installations, Chromium download and MCP registration. |
+| `--skip-playwright` | Skip Playwright package, browser download and both registrations. |
+| `--skip-graphify` | Skip graphify's project integrations; the tools stage still checks/installs graphify. |
+| `--skip-impeccable` | Skip Impeccable project installation. |
+| `--impeccable-providers=codex` | Install design skills only for Codex when Claude already uses the Impeccable plugin. |
+| `--update-sections` | Replace existing workflow sections in `CLAUDE.md` and `AGENTS.md` with bundled versions. |
+| `--root <dir>` | Configure the Git repository containing that directory. |
+
+### Finish initial setup
+
+1. Open `claude` and follow its sign-in flow; run `codex login` if needed.
+2. Restart both clients. Check `/mcp` for Playwright, and inspect registrations with `claude mcp get playwright` and `codex mcp get playwright`.
+3. Review and trust `.codex/hooks.json` in Codex using `/hooks` when needed. Later hook changes require trusting them again.
+4. Allow the helper's `verify`, `triage` and `close` commands network access and a long timeout when Codex requests approval: they start headless Claude sessions.
+5. Once the project has code, build the initial graph with `/graphify .` in Claude Code.
+6. Run `/impeccable init` for `PRODUCT.md`; for an existing UI, follow with `/impeccable document` for `DESIGN.md`. Use `/impeccable doctor` for an older design setup.
+7. Review detected checks and add `.codex/verify.json` if they are missing or unsuitable.
+
+## Playwright browser tools
+
+Playwright is included in default **machine setup**. The browser download uses the Playwright version inside the installed MCP package, avoiding a browser mismatch with a separately fetched version.
+
+New registrations use absolute Node, server and Chromium paths, with `--headless` and `--isolated`. Browser sessions have separate state and no visible window, so the agents do not share a persistent profile. Existing registrations retain their settings. See the official [Playwright MCP guide](https://github.com/microsoft/playwright-mcp) for server capabilities and options.
+
+Start your app normally, then give either agent the actual URL and expected behavior:
+
+```text
+Use Playwright to inspect http://localhost:3000/settings. Check that Save is disabled
+until a field changes, saving shows confirmation, and the page fits desktop and
+mobile viewport sizes. Report console errors and capture relevant screenshots.
+```
+
+For an orchestrated task, put the startup command, URL, browser steps and expected results in the plan. MCP provides interactive browser tools; it does not create a test suite or automatically launch your application. The headless Step A/B reviewers do not have MCP browser tools in their allowed tool lists. Step A can run an existing browser test command if configured as a check.
+
+For repeatable browser gates, install `@playwright/test` in the application's own development dependencies using its package manager, write specs and configure the test server. A gate can then run `npx playwright test tests/settings.spec.ts`. That project test runner and lockfile are separate from global MCP and may require their own matching browser download.
+
+Minimal Linux systems may need OS libraries for Chromium. With administrator approval, run the installed MCP package's bundled Playwright CLI with `install-deps chromium`. Locate global packages with `npm root -g`; setup does not automatically install system packages. See [Playwright browser dependencies and caches](https://playwright.dev/docs/browsers).
+
+## Daily use: what happens during a task
+
+1. **Describe the task to Claude.** For app-code changes, choose direct implementation or orchestration. Direct implementation uses Claude's session and project checks without the phased Codex handoff.
+2. **Review the plan.** Claude writes `plans/<task>.md` with scope, acceptance criteria, risk and runnable gates. It validates the plan. High-risk work enables Codex plan review.
+3. **Paste the handoff into Codex:**
+
+   ```text
    Execute plans/<task>.md
    ```
-3. Paste that line into Codex. Wait for `Task <task> done. Review and commit the changes.`
-4. Review the working tree and commit.
 
-Say "manual" to Claude to hand off one phase at a time instead.
+4. **Preflight and optional plan review.** The helper validates phases and snapshots the working tree. Existing uncommitted work becomes the starting baseline. When enabled, Codex appends plan findings and headless Claude triages them before implementation.
+5. **Implement each phase.** Codex edits scoped files; the helper runs the gate. Gate failures return to Codex for fixes. After the gate passes, two headless Claude calls run in sequence:
 
-## What's inside
+   | Step | Default model / effort | Behavior | Report |
+   |---|---|---|---|
+   | A: checks | Sonnet / low | Runs detected or configured checks; fixes lint, formatting and type errors; reports other failures. | `.codex/verify/last.log` |
+   | B: alignment | Sonnet / medium; Opus for high risk or configured risk paths | Reads the plan and diff, reports completeness, scope, gates and risks, then returns `PASS` or `NEEDS REWORK`. Editing tools are denied. | `.codex/verify/alignment.md` |
 
+   On `NEEDS REWORK`, Codex fixes findings and verifies again. After two reworks, another failed review stops the run as `stuck`. Each repeated review adds Claude usage. The verified snapshot advances only on `PASS`.
+6. **Close the task.** The helper runs `graphify update .` and a Sonnet / low Claude call writes `docs/tasks/<date>-<task>.md`. Codex reports completion. You review the changes and commit them.
+
+Snapshots use a temporary Git index and tree objects; they do not change your real staging index or create branch commits. During helper-driven execution, the Stop hook stays quiet to avoid overlapping verification. In manual phase mode, the Stop hook launches review after Codex ends its turn; wait for `Finished` in the log before another edit turn.
+
+Say **manual** to Claude to hand off one phase at a time. The [workflow skill](skills/claude-codex-workflow/SKILL.md) also covers unattended `autopilot.js run` and `--resume` commands.
+
+## Configure verification
+
+Checks are detected from root-level Node, Rust, Go and Python markers. Node checks use the detected npm/pnpm/yarn/bun commands and available typecheck, lint, build and non-watch test scripts. Monorepos, custom checks and browser suites often need an override:
+
+```json
+{
+  "checks": [
+    "npm run typecheck",
+    "npm run lint",
+    "npm test",
+    "npx playwright test tests/settings.spec.ts"
+  ],
+  "alignment": {
+    "model": "sonnet",
+    "effort": "medium",
+    "riskModel": "opus",
+    "riskPaths": ["src/auth/**", "migrations/**"]
+  }
+}
 ```
-commands/setup.md                  # /claude-codex-workflow:setup
-package.json                       # npx entry point for the installer
+
+Save this as `.codex/verify.json`, retaining only commands your project supports. `checks` replaces auto-detection; an empty list runs no executable checks. An `alignment`-only configuration retains auto-detection. Gates live in the plan and may be narrower than the full check list.
+
+Inspect the resolved setup:
+
+```sh
+node .codex/hooks/claude-verify.js --print-checks
+node .codex/autopilot.js check plans/<task>.md
+```
+
+## Token usage for Claude and Codex
+
+**There is no fixed token count for installation or a task.** Running the installer directly executes local commands without calling Claude or Codex models. Package and browser downloads are not model tokens. Setup through Claude uses tokens for the conversation, command output and follow-up analysis. Graph building, design interviews and subsequent coding/review sessions are separate work and may use models.
+
+Claude and Codex have **separate usage accounting**. A Claude subprocess launched by Codex uses Claude's authenticated account or API credentials; it does not become Codex usage. This plugin neither supplies credits nor combines billing.
+
+| Activity | Claude usage | Codex usage |
+|---|---|---|
+| Direct shell installation | No Claude model calls from the installer | No Codex model calls from the installer |
+| Setup invoked in Claude | Setup conversation and analysis of output | No Codex model calls from the installer |
+| Direct implementation in Claude | Reads, reasoning, edits and checks in that session | None unless Codex is separately requested |
+| Orchestrated planning | Plan creation and revisions | Optional plan review |
+| Phase implementation | Headless verification after passing gates | Implementation, gate fixes and review rework |
+| Verification | Step A + Step B per review attempt | Reading findings and fixing them |
+| Optional plan triage | One Sonnet / medium headless call | Plan review and reading the revised plan |
+| Task close | One Sonnet / low headless summary call | Closing coordination in the active session |
+| Browser inspection | Usage belongs to Claude when it drives Playwright | Usage belongs to Codex when it drives Playwright |
+
+For `P` phases and `R` additional verification attempts that reach Claude review, a successful orchestrated run normally starts **`2 × (P + R) + 1 + T` headless Claude calls**, where `T = 1` if plan triage runs, otherwise `0`. Three phases with no rework or triage mean seven headless Claude calls, plus interactive planning and Codex implementation. Gate failures occur before Claude review, so fixing one does not itself add two Claude calls. Interrupted calls can change these counts. Calls are not tokens: a call can contain multiple model turns and tool interactions.
+
+### See your actual usage
+
+| Agent | Where to look | Meaning |
+|---|---|---|
+| Claude Code | `/usage`; older versions may expose `/cost`; `/context` for context occupancy | Current-session usage/model breakdown where supported, plus subscription information depending on account and version. |
+| Claude API billing | Claude Console usage reporting | Authoritative account billing; planner-session totals alone do not include separate headless sessions. |
+| Codex CLI | `/status`, `/usage` where available, `/statusline` token fields | Session usage/configuration and available account token activity. |
+| OpenAI API billing | OpenAI Platform usage reporting | API-key usage; subscription limits and dollar billing are distinct from raw token counts. |
+
+See the official [Claude usage and cost guide](https://code.claude.com/docs/en/costs) and [Codex CLI command reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli). Availability varies by client version and authentication. Context occupancy is not cumulative consumption; an API-equivalent dollar estimate is not a subscription invoice.
+
+**The plugin saves plain-text reports, not a structured combined token ledger.** It does not collect every call's input, output, cache and reasoning counters or generate a per-task dollar total. To establish a measured baseline, record available counters before and after a representative task and include separate Claude headless sessions in account reporting. Concurrent work can affect account-level differences. Keep model names and cached-token categories alongside measurements, and avoid counting a session twice.
+
+### What increases usage, and what helps
+
+Large file reads, conversation history, repeated tool output, screenshots, extra phases and rework all add context or output. Reasoning usage is model-dependent; cached input is accounted for separately where reported. Two agents reviewing the same work intentionally repeat some context. Scoped diffs and clear acceptance criteria help keep that repetition useful.
+
+Use graphify to narrow discovery, request focused Playwright interactions and screenshots, and keep checks deterministic. Reserve high-risk review settings for work that needs them. Use `/caveman` in Claude or request caveman mode in Codex for shorter replies. These practices can reduce unnecessary usage; this repository has no benchmark proving a fixed saving.
+
+## Reports, recovery and troubleshooting
+
+| Artifact | Contents |
+|---|---|
+| `plans/<task>.md` | Approved requirements, phases, gates and plan findings; ignored by default except the template. |
+| `.codex/autopilot/status.json` | State (`running`, `done`, `stuck`, `failed`), phase, step and reason. |
+| `.codex/autopilot/<task>.log` | Helper progress log. |
+| `.codex/verify/phase.diff` | Changes presented to the verifier. |
+| `.codex/verify/last.log` | Latest checks report and completion information. |
+| `.codex/verify/alignment.md` | Latest alignment report and verdict. |
+| `docs/tasks/<date>-<task>.md` | Final task summary for review and commit. |
+
+Verification reports are overwritten on the next run. Verification/helper state, graph output and individual plans are ignored by Git; task summaries can be committed with the code.
+
+- **Failed setup steps:** fix the reported prerequisite, network or installation issue and re-run. Missing tools in a noninteractive run require `--yes`; successful partial steps remain.
+- **Playwright missing from `/mcp`:** restart clients, inspect `mcp get playwright`, and re-run full setup rather than `--project-only`. Existing entries are kept; repair stale custom entries yourself. Moving Node/global packages can invalidate absolute registration paths.
+- **Chromium cannot launch:** check current platform support and Linux system dependencies. Download success alone does not verify launchability.
+- **No browser tests ran:** MCP tools are used when requested. Add actual project specs and their command to gates/checks for repeatable assertions.
+- **`stuck` run:** read alignment findings, resolve the code or plan decision, and tell Codex to continue the stopped step.
+- **`failed` run:** read the reason/logs, fix authentication, permissions, network or command failure, then continue. Helper-launched agent calls have a 30-minute timeout each.
+- **Wrong or missing checks:** inspect `--print-checks` and configure `.codex/verify.json`, especially for monorepos.
+- **Stale Impeccable context:** run `/impeccable doctor`. Remove its `impeccable-live-start`/`impeccable-live-end` block before committing a production app.
+
+## Repository layout
+
+```text
+.claude-plugin/                     # plugin and marketplace manifests
+commands/setup.md                   # Claude Code setup command
+package.json                        # npx installer entry point
 skills/claude-codex-workflow/
-  SKILL.md                         # the full guide: flow, setup, checks, troubleshooting
-  scripts/install.js               # installs tools and sets up the project
+  SKILL.md                          # workflow guide and advanced operation
+  scripts/install.js                # machine and project installer
+  scripts/playwright.js              # browser package, Chromium and MCP setup
   templates/
-    CLAUDE.workflow.md             # merged into CLAUDE.md
-    AGENTS.codex.md                # merged into AGENTS.md
-    codex/hooks.json               # merged into .codex/hooks.json
-    codex/hooks/claude-verify.js   # copied to .codex/hooks/claude-verify.js
-    codex/hooks/workflow-lib.js    # copied to .codex/hooks/workflow-lib.js
-    codex/autopilot.js             # copied to .codex/autopilot.js (the step helper Codex calls)
-    plans/_template.md             # copied to plans/_template.md (phased plan template)
-    skills/caveman/SKILL.md        # copied to .claude/skills/caveman/ and .agents/skills/caveman/
+    CLAUDE.workflow.md               # merged Claude instructions
+    AGENTS.codex.md                  # merged Codex instructions
+    codex/hooks.json                 # merged project hooks
+    codex/hooks/claude-verify.js      # two-step headless review
+    codex/hooks/workflow-lib.js       # plan parsing and Git snapshots
+    codex/autopilot.js               # phase helper
+    plans/_template.md               # phased plan template
+    skills/caveman/SKILL.md          # optional terse-response skill
+tests/                              # installer regression tests
 ```
 
-See [SKILL.md](skills/claude-codex-workflow/SKILL.md) for the full flow and troubleshooting.
+Run `npm test` to check the Playwright setup flow without downloading browsers, invoking models or changing user MCP configuration.

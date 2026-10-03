@@ -1,6 +1,6 @@
 {
   "name": "claude-codex-workflow",
-  "description": "Claude plans or implements, Codex implements, and a background Claude run checks and fixes Codex's work. graphify, Impeccable and caveman are wired in for both agents.",
+  "description": "Claude plans or implements, Codex implements, and a background Claude run checks and fixes Codex's work. Playwright, graphify, Impeccable and caveman are wired in for both agents.",
   "owner": {
     "name": "Jonrei",
     "url": "https://github.com/Jonrei1"
@@ -9,7 +9,7 @@
     {
       "name": "claude-codex-workflow",
       "source": "./",
-      "description": "Set up the Claude + Codex workflow in any project with one command (/claude-codex-workflow:setup installs Claude Code, Codex CLI, graphify and Impeccable). Claude plans; one pasted line has Codex run every phase with background Claude verification."
+      "description": "Set up the Claude + Codex workflow in any project with one command (/claude-codex-workflow:setup installs Claude Code, Codex CLI, Playwright, graphify and Impeccable). Claude plans; one pasted line has Codex run every phase with background Claude verification."
     }
   ]
 }

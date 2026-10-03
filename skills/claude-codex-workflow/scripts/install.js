@@ -8,7 +8,7 @@
 //   npx github:Jonrei1/Claude-Codex-Workflow [flags]
 //   /claude-codex-workflow:setup [flags]          (in Claude Code)
 //
-// 1. Tools: checks node, git, Claude Code, Codex CLI and graphify, and installs the
+// 1. Tools: checks node, git, Claude Code, Codex CLI, Playwright and graphify, and installs the
 //    missing ones (global installs ask first unless --yes is given).
 // 2. Project: copies the workflow scripts, merges the CLAUDE.md / AGENTS.md sections and
 //    .codex/hooks.json, adds the caveman skill for both agents, updates .gitignore, runs
@@ -20,12 +20,12 @@
 // installer upgrades a project. It never commits.
 //
 // Flags:
-//   --yes                       install missing global tools without asking
+//   --yes                       approve missing global tools and Playwright setup
 //   --tools-only | --project-only
 //   --dry-run                   print what would happen, change nothing
 //   --update-sections           replace existing ## Workflow / ## Codex execution sections
 //   --impeccable-providers=<l>  default claude,codex (use codex if you have the Impeccable plugin)
-//   --skip-graphify | --skip-impeccable
+//   --skip-graphify | --skip-impeccable | --skip-playwright
 //   --root <dir>                project directory (default: current directory)
 
 const fs = require("node:fs");
@@ -33,6 +33,7 @@ const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
 const { spawnSync } = require("node:child_process");
+const { setupPlaywright } = require("./playwright");
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(name);
@@ -137,6 +138,9 @@ async function installTools() {
   if (has("codex") && !dryRun && run("codex", ["login", "status"], { timeout: 60 * 1000 }).status !== 0) {
     record("Codex login", false, "run `codex login`");
   }
+
+  if (flag("--skip-playwright")) record("Playwright setup", null, "skipped (--skip-playwright)");
+  else await setupPlaywright({ run, has, confirm, record, dryRun });
 
   let graphify = findGraphify();
   if (!graphify) {
@@ -355,6 +359,8 @@ Left for you:
   4. /impeccable init in Claude Code writes PRODUCT.md. In an existing project, follow with
      /impeccable document to capture DESIGN.md.
   5. If the detected checks above are wrong or empty, add .codex/verify.json.
+  6. Restart Claude and Codex, and check /mcp for Playwright (unless skipped). Start your app
+     before asking either agent to inspect it. Browser checks must be requested in the plan.
 Then plan a task with Claude, and paste the one line it ends with into Codex: Execute plans/<task>.md`);
   }
   process.exitCode = failed.length ? 1 : 0;

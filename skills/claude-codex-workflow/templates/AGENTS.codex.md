@@ -83,6 +83,12 @@ For UI work, use the impeccable skill and follow `PRODUCT.md` and `DESIGN.md`. R
 impeccable command the plan names. Never commit impeccable's live-mode block
 (`impeccable-live-start` … `impeccable-live-end`).
 
+Use Playwright MCP for browser acceptance steps named in the plan. Start the app
+with the specified command, inspect the specified URL and viewport sizes, and report
+the observed results. MCP setup provides browser tools, not project test specs. Run
+existing Playwright specs when a gate names them; headless Claude reviews do not
+use MCP browser tools themselves.
+
 <!-- After `graphify codex install` appends its graphify section, make sure that section ends with this rule. Use the same rule in the section `graphify claude install` adds to CLAUDE.md. -->
 
 - After all code edits for a task are complete, run `graphify update .` once at the end

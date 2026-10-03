@@ -17,6 +17,7 @@ One or two sentences. What changes for the user.
 ## Acceptance
 - Backend: <test command or endpoint check>
 - Frontend: <Playwright spec path, tagged @smoke if fast, if the project has Playwright>
+- Browser inspection (if requested): <app startup command, URL, viewports, interactions and expected results using Playwright MCP; executable gates still need test commands>
 
 ## Phase 1: <title>
 **Scope:** files and interfaces

@@ -1,6 +1,6 @@
 ---
-description: Install every tool (Claude Code, Codex CLI, graphify, Impeccable) and set up the Claude + Codex workflow in this project
-argument-hint: "[--yes] [--dry-run] [--tools-only|--project-only] [--update-sections] [--impeccable-providers=codex]"
+description: Install every tool (Claude Code, Codex CLI, Playwright, graphify, Impeccable) and set up the Claude + Codex workflow in this project
+argument-hint: "[--yes] [--dry-run] [--tools-only|--project-only] [--update-sections] [--impeccable-providers=codex] [--skip-playwright]"
 allowed-tools: Bash(node:*), Read, Write, Edit
 ---
 
@@ -24,5 +24,10 @@ Set up the Claude + Codex workflow in the current project.
    migration and auth paths (see the claude-codex-workflow skill, "Checks").
 4. List the "Left for you" steps, and the new- or existing-project steps from the
    skill's Setup section (`/graphify .`, `/impeccable init`, `/impeccable document`).
+5. Explain that Playwright setup installs a global MCP server and matching Chromium,
+   and adds missing user registrations for both agents. Existing registrations are
+   kept. Restart both clients and check `/mcp`. It does not scaffold browser tests;
+   browser acceptance checks must be named in the task plan. `--project-only` skips
+   Playwright setup; `--skip-playwright` opts out explicitly.
 
 Don't commit anything.

@@ -2,10 +2,10 @@
 name: claude-codex-workflow
 description: >
   Set up the Claude + Codex workflow in a project, new or existing, on any stack, with one installer
-  that also installs Claude Code, the Codex CLI, graphify and Impeccable. Claude either implements
+  that also installs Claude Code, the Codex CLI, Playwright, graphify and Impeccable. Claude either implements
   tasks directly or writes phased plans, then hands off with one pasted line (`Execute plans/<task>.md`)
   that has Codex run every phase, with a headless Claude run checking and reviewing each one.
-  graphify, Impeccable and caveman are wired in for both agents.
+  Playwright, graphify, Impeccable and caveman are wired in for both agents.
   Use when the user asks to set up or install the Claude Codex workflow, add the Codex verify hook,
   set up the orchestrator/Codex handoff, or install the caveman/graphify/Impeccable workflow in a project.
 ---
@@ -22,6 +22,8 @@ A reusable setup for any project, new or existing, on any stack, on Windows, mac
 - **One-paste execution** (the default handoff): Claude always ends an approved plan with one line, `Execute plans/<task>.md`. Paste it into Codex once, and Codex runs the whole task: plan review, every phase with its gate, Claude verification and rework, then the task summary.
 - **One-command setup:** `scripts/install.js` (also `/claude-codex-workflow:setup` or `npx github:Jonrei1/Claude-Codex-Workflow`) installs the missing tools and wires everything into the project.
 - graphify gives both agents a knowledge graph of the codebase.
+- Playwright MCP gives both agents browser tools, with matching Chromium installed once.
+  Request browser acceptance checks in the plan; the headless reviewers do not use MCP browser tools.
 - Impeccable gives both agents design skills (24 `/impeccable` commands) and a hook that flags UI problems after edits.
 - caveman keeps replies short when you want to save tokens.
 
@@ -115,7 +117,7 @@ npx github:Jonrei1/Claude-Codex-Workflow                       # anywhere, no pl
 node <skill folder>/scripts/install.js                         # from a copy of this skill
 ```
 
-Flags: `--yes` (install missing global tools without asking), `--dry-run`, `--tools-only`, `--project-only`, `--update-sections`, `--impeccable-providers=codex`, `--skip-graphify`, `--skip-impeccable`, `--root <dir>`. Re-running is safe: it skips what's already there and upgrades the `.codex/` scripts to the plugin's version.
+Flags: `--yes` (approve missing global tools and Playwright setup), `--dry-run`, `--tools-only`, `--project-only`, `--update-sections`, `--impeccable-providers=codex`, `--skip-graphify`, `--skip-impeccable`, `--skip-playwright`, `--root <dir>`. Re-running keeps existing Playwright registrations and upgrades the `.codex/` scripts to the plugin's version. `--project-only` skips global tools, Chromium and MCP registration.
 
 ### What the installer does
 
@@ -126,6 +128,7 @@ Flags: `--yes` (install missing global tools without asking), `--dry-run`, `--to
 | Node 18+ and git | your OS package manager (not automatic) | Node runs the hooks and the helper on every OS. |
 | Claude Code CLI | `npm install -g @anthropic-ai/claude-code` | The verify step calls it headless. |
 | Codex CLI | `npm install -g @openai/codex` | Then `codex login` if `codex login status` fails. |
+| Playwright MCP + Chromium | `npm install -g @playwright/mcp`, then its bundled Playwright CLI's `install chromium` | Registers missing `playwright` servers in Claude user scope and Codex user config, using absolute Node, server and Chromium paths with `--headless --isolated`. Existing entries are kept. Use `--skip-playwright` to opt out. |
 | graphify | `uv tool install graphifyy`, else `pipx install graphifyy`, else `pip install --user graphifyy` | If it lands outside PATH, the installer uses its full path. |
 | Impeccable | nothing global | Runs through `npx`. Claude Code can use the Impeccable plugin instead (then pass `--impeccable-providers=codex`). |
 
@@ -148,6 +151,11 @@ Flags: `--yes` (install missing global tools without asking), `--dry-run`, `--to
 4. Commit `PRODUCT.md`, `DESIGN.md`, `.impeccable/config.json` and `.impeccable/design.json` when they exist.
 5. Keep `.claude/settings.json` free of hooks that block Claude from editing code. Impeccable's Claude hook only reports findings; it doesn't block.
 6. **Optional: tune the models.** Step B's model, effort and risk model come from the `alignment` block in `.codex/verify.json` (see [Checks](#checks)). Step A's `--model sonnet --effort low` is in `claude-verify.js`.
+7. **Restart both clients and check `/mcp` for Playwright.** Start the application before
+   requesting browser checks. Browser binaries are cached per user; Linux may also need
+   system dependencies. See the [README](../../README.md#playwright-browser-tools) for
+   browser setup, limitations and troubleshooting, and its [usage guide](../../README.md#token-usage-for-claude-and-codex)
+   for separate Claude/Codex consumption and the per-phase review overhead.
 
 Per-OS notes:
 - **Windows:** Codex runs `commandWindows` from `hooks.json`. Impeccable's launcher is `impeccable.cmd`. If `npm run build` fails under Bash with `0xc0000142`, run it under PowerShell. The verify hook already allows PowerShell for its checks on Windows.

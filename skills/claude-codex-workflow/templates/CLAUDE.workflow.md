@@ -44,6 +44,9 @@
   - Backend phases list expected files and dependents from `graphify query`.
   - UI phases name the Impeccable command to run, and the Playwright spec if the
     project has one.
+  - Requested browser acceptance steps name the app startup command, URL, interactions,
+    viewport sizes and expected results. Playwright MCP is available after machine
+    setup; it does not create project test specs. Use executable tests for phase gates.
   - Set `risk: high` in the frontmatter for schema, auth, payments, or cross-layer
     contract changes. It switches the alignment review to Opus.
   - Phases apply to orchestrator plans only. Implement-directly tasks don't use them.
@@ -78,8 +81,10 @@
   Never commit impeccable's live-mode block (`impeccable-live-start` …
   `impeccable-live-end` in the root layout).
 
-Functional/manual testing stays with the user. Claude doesn't log in, drive the browser
-preview, or ask for credentials.
+Use Playwright MCP for browser acceptance checks requested by the user or approved
+plan. Start the app first and record the results. Headless verification does not use
+MCP browser tools; Step A can run configured browser test commands. Manual testing
+and providing any authenticated browser state stay with the user.
 
 ### Closing a task
 
