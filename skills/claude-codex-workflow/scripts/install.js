@@ -12,20 +12,24 @@
 //    missing ones (global installs ask first unless --yes is given).
 // 2. Project: copies the workflow scripts, merges the CLAUDE.md / AGENTS.md sections and
 //    .codex/hooks.json, adds the caveman skill for both agents, updates .gitignore, runs
-//    `graphify claude install`, `graphify codex install` and `npx impeccable install`,
-//    then prints the detected checks.
+//    `graphify claude install` and `graphify codex install`, then prints the detected checks.
+//    Impeccable (`npx impeccable install`, design skills and UI hooks) is optional: it is
+//    installed only with --impeccable, or when you answer yes to the prompt.
 //
 // It never overwrites CLAUDE.md, AGENTS.md or hooks.json; it merges into them. The scripts
 // under .codex/ belong to the workflow and are updated on every run, so re-running the
 // installer upgrades a project. It never commits.
 //
 // Flags:
-//   --yes                       approve missing global tools and Playwright setup
+//   --yes                       approve missing global tools and Playwright setup (not Impeccable)
 //   --tools-only | --project-only
 //   --dry-run                   print what would happen, change nothing
 //   --update-sections           replace existing ## Workflow / ## Codex execution sections
-//   --impeccable-providers=<l>  default claude,codex (use codex if you have the Impeccable plugin)
-//   --skip-graphify | --skip-impeccable | --skip-playwright
+//   --impeccable                install Impeccable (otherwise asked on a terminal, skipped elsewhere)
+//   --impeccable-providers=<l>  implies --impeccable; default claude,codex (use codex if you have the Impeccable plugin)
+//   --skip-impeccable           don't install Impeccable and don't ask
+//   --graphify-scope=<s>        user (default) or global; asked on a terminal when graphify is missing
+//   --skip-graphify | --skip-playwright
 //   --root <dir>                project directory (default: current directory)
 
 const fs = require("node:fs");
@@ -76,13 +80,42 @@ function has(command) {
   return result.status === 0 ? (result.stdout || "").trim().split("\n")[0] : "";
 }
 
-async function confirm(question) {
-  if (flag("--yes")) return true;
+// Asks on the terminal, whatever flags were given. False when there's no terminal to ask on.
+async function ask(question) {
   if (!process.stdin.isTTY) return false;
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise((resolve) => rl.question(`${question} [y/N] `, resolve));
   rl.close();
   return /^y(es)?$/i.test(answer.trim());
+}
+
+// --yes approves the machine tools. It doesn't approve optional extras like Impeccable.
+async function confirm(question) {
+  return flag("--yes") || ask(question);
+}
+
+// Where graphify goes: "user" (default) or "global". --graphify-scope=<user|global> decides;
+// otherwise a terminal is asked, and --yes, --dry-run or no terminal mean "user".
+async function graphifyScope() {
+  const given = flagValue("--graphify-scope").toLowerCase();
+  if (given === "user" || given === "global") return given;
+  if (dryRun || flag("--yes") || !process.stdin.isTTY) return "user";
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise((resolve) =>
+    rl.question("Install graphify for your user only, or globally for every user (needs admin rights)? [user/global] (default user) ", resolve),
+  );
+  rl.close();
+  return /^g(lobal)?$/i.test(answer.trim()) ? "global" : "user";
+}
+
+// Impeccable (design skills and UI hooks) is optional and never installed by default:
+// --impeccable (or --impeccable-providers) opts in, --skip-impeccable opts out, and
+// otherwise the user is asked. --yes, --dry-run and a missing terminal all mean "no".
+async function wantsImpeccable() {
+  if (flag("--skip-impeccable")) return false;
+  if (flag("--impeccable") || flagValue("--impeccable-providers")) return true;
+  if (dryRun || flag("--yes") || !process.stdin.isTTY) return false;
+  return ask("Install Impeccable (optional design skills and UI hooks, useful for UI work)?");
 }
 
 // Runs an install command after asking. Returns true when it ran and succeeded.
@@ -119,7 +152,7 @@ function findGraphify() {
   return found ? found.split(path.sep).join("/") : "";
 }
 
-async function installTools() {
+async function installTools(impeccable) {
   console.log("\nTools");
   const major = Number(process.versions.node.split(".")[0]);
   record("node", major >= 18, major >= 18 ? process.version : `${process.version}; need 18 or newer`);
@@ -144,11 +177,19 @@ async function installTools() {
 
   let graphify = findGraphify();
   if (!graphify) {
-    const installers = [
-      ["uv", ["tool", "install", "graphifyy"]],
-      ["pipx", ["install", "graphifyy"]],
-      [isWindows ? "python" : "python3", ["-m", "pip", "install", "--user", "graphifyy"]],
-    ];
+    const python = isWindows ? "python" : "python3";
+    const scope = await graphifyScope();
+    console.log(`  graphify install scope: ${scope}`);
+    // user: into your home directory, no admin rights. global: system-wide pip, which
+    // usually needs administrator/root rights and is shared by every user on the machine.
+    const installers =
+      scope === "global"
+        ? [[python, ["-m", "pip", "install", "graphifyy"]]]
+        : [
+            ["uv", ["tool", "install", "graphifyy"]],
+            ["pipx", ["install", "graphifyy"]],
+            [python, ["-m", "pip", "install", "--user", "graphifyy"]],
+          ];
     const available = installers.find(([command]) => has(command));
     if (!available) record("graphify", false, "install uv (https://docs.astral.sh/uv/) or Python, then re-run");
     else if (await install("graphify", available[0], available[1])) graphify = findGraphify();
@@ -159,7 +200,9 @@ async function installTools() {
     record("graphify", false, "installed but not found; add ~/.local/bin to PATH and re-run");
   }
 
-  record("npx (Impeccable)", Boolean(has("npx")), has("npx") ? "Impeccable runs through npx; nothing global to install" : "missing; comes with Node");
+  if (impeccable) {
+    record("npx (Impeccable)", Boolean(has("npx")), has("npx") ? "Impeccable runs through npx; nothing global to install" : "missing; comes with Node");
+  }
   return graphify;
 }
 
@@ -284,7 +327,7 @@ function runStep(root, step, command, commandArgs) {
   record(step, result.status === 0, result.status === 0 ? "" : `\`${line}\` exited with ${result.status ?? "a timeout"}`);
 }
 
-function setupProject(root, graphify) {
+function setupProject(root, graphify, impeccable) {
   console.log(`\nProject: ${root}`);
   for (const file of ["codex/hooks/claude-verify.js", "codex/hooks/workflow-lib.js", "codex/autopilot.js"]) {
     copyOwned(root, file, `.${file}`);
@@ -310,8 +353,9 @@ function setupProject(root, graphify) {
     ensureGraphifyRule(root, "AGENTS.md");
   }
 
-  if (flag("--skip-impeccable")) record("impeccable install", null, "skipped (--skip-impeccable)");
-  else {
+  if (!impeccable) {
+    record("impeccable install", null, flag("--skip-impeccable") ? "skipped (--skip-impeccable)" : "skipped (optional; re-run with --impeccable to add it)");
+  } else {
     const providers = flagValue("--impeccable-providers") || "claude,codex";
     runStep(root, "impeccable install", "npx", ["-y", "impeccable", "install", "--project", `--providers=${providers}`]);
     // Impeccable merges its own hooks into .codex/hooks.json; make sure ours survived.
@@ -336,13 +380,14 @@ async function main() {
   const doProject = !flag("--tools-only");
   if (dryRun) console.log("Dry run: nothing is installed or written.");
 
-  const graphify = doTools ? await installTools() : findGraphify();
+  const impeccable = doProject && (await wantsImpeccable());
+  const graphify = doTools ? await installTools(impeccable) : findGraphify();
   if (doProject) {
     const root = projectRoot();
     if (!root) {
       record("project", false, "not inside a git repository; run `git init` first, or pass --root <dir>");
     } else {
-      setupProject(root, graphify);
+      setupProject(root, graphify, impeccable);
     }
   }
 
@@ -356,8 +401,8 @@ Left for you:
   2. Codex runs the verify step (headless Claude) from its own session. Let those commands use the
      network and a long timeout (30 min); approve them when Codex asks to run outside the sandbox.
   3. Build the first graph: /graphify . in Claude Code (needs some code first).
-  4. /impeccable init in Claude Code writes PRODUCT.md. In an existing project, follow with
-     /impeccable document to capture DESIGN.md.
+${impeccable ? `  4. /impeccable init in Claude Code writes PRODUCT.md. In an existing project, follow with
+     /impeccable document to capture DESIGN.md.` : `  4. Impeccable (design skills, optional) wasn't installed. For UI-heavy work, re-run with --impeccable.`}
   5. If the detected checks above are wrong or empty, add .codex/verify.json.
   6. Restart Claude and Codex, and check /mcp for Playwright (unless skipped). Start your app
      before asking either agent to inspect it. Browser checks must be requested in the plan.

@@ -79,8 +79,9 @@ Rules for this mode:
   missing test gates, unclear acceptance criteria, risky ordering.
 - End with: `PLAN REVIEW: APPROVE | CHANGES NEEDED`.
 
-For UI work, use the impeccable skill and follow `PRODUCT.md` and `DESIGN.md`. Run any
-impeccable command the plan names. Never commit impeccable's live-mode block
+If the impeccable skill is installed, use it for UI work and follow `PRODUCT.md` and
+`DESIGN.md`; run any impeccable command the plan names. If it isn't installed, follow the
+project's existing design conventions. Never commit impeccable's live-mode block
 (`impeccable-live-start` … `impeccable-live-end`).
 
 Use Playwright MCP for browser acceptance steps named in the plan. Start the app

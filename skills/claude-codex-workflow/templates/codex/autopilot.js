@@ -12,6 +12,7 @@
 //   node .codex/autopilot.js phase  plans/<slug>.md <N>   snapshot the phase's starting tree
 //   node .codex/autopilot.js verify plans/<slug>.md <N>   gate, then claude-verify.js --run
 //   node .codex/autopilot.js close  plans/<slug>.md       graphify update + Claude task summary
+//   node .codex/autopilot.js usage [plans/<slug>.md]      headless Claude token usage so far
 //
 // Exit codes: 0 ok / PASS, 1 failed, 2 gate failed (fix and verify again),
 // 3 NEEDS REWORK (read .codex/verify/alignment.md, fix, verify again), 4 stuck (stop).
@@ -32,7 +33,7 @@ const lib = require("./hooks/workflow-lib");
 const args = process.argv.slice(2);
 const flags = new Set(args.filter((arg) => arg.startsWith("--")));
 const positional = args.filter((arg) => !arg.startsWith("--"));
-const commands = ["check", "begin", "triage", "phase", "verify", "close", "run"];
+const commands = ["check", "begin", "triage", "phase", "verify", "close", "run", "usage"];
 const command = commands.includes(positional[0]) ? positional.shift() : flags.has("--dry-run") ? "check" : "run";
 const [planArg, phaseArg] = positional;
 const repoRoot = path.resolve(__dirname, "..");
@@ -129,11 +130,11 @@ function codex(prompt, name) {
 
 function claude(prompt, name, { model, effort, tools }) {
   log(`claude (${model}/${effort}): ${name}`);
-  const result = run("claude", ["-p", prompt, "--model", model, "--effort", effort, "--allowedTools", ...tools]);
-  const output = saveOutput(`claude.${name}`, result);
+  const result = lib.runClaude(repoRoot, { name, task: slug, prompt, model, effort, allowed: tools, env: childEnv, timeout: callTimeoutMs });
+  const output = saveOutput(`claude.${name}`, { stdout: result.text, stderr: result.stderr });
   if (result.error) throw new Stop("failed", `claude ${name} didn't run: ${result.error.message}`);
   if (result.status !== 0) throw new Stop("failed", `claude ${name} exited with ${result.status}; see ${output}`);
-  return (result.stdout || "").trim();
+  return result.text;
 }
 
 function readPlan() {
@@ -361,7 +362,8 @@ function usage() {
   console.error(`usage:
   node .codex/autopilot.js check|begin|triage|close plans/<slug>.md
   node .codex/autopilot.js phase|verify plans/<slug>.md <N>
-  node .codex/autopilot.js run plans/<slug>.md [--resume] [--force]`);
+  node .codex/autopilot.js run plans/<slug>.md [--resume] [--force]
+  node .codex/autopilot.js usage [plans/<slug>.md]   headless Claude token usage`);
   process.exit(exitCodes.failed);
 }
 
@@ -507,6 +509,11 @@ function cmdRun() {
 }
 
 function main() {
+  if (command === "usage") {
+    const slugArg = planArg ? path.basename(planArg, ".md") : "";
+    console.log(lib.usageSummary(repoRoot, slugArg));
+    return;
+  }
   if (!planArg || (["phase", "verify"].includes(command) && !phaseArg)) usage();
   const planPath = path.resolve(planArg);
   planRel = path.relative(repoRoot, planPath).split(path.sep).join("/");

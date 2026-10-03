@@ -4,8 +4,10 @@
 // Codex Stop hook: when the working tree changed since the last verified snapshot, hand
 // verification to Claude Code in the background, in two steps:
 //
-//   Step A  checks + mechanical fixes (Sonnet, low effort). Runs the project's checks
-//           and fixes only lint, formatting and type errors. Report: .codex/verify/last.log
+//   Step A  checks + mechanical fixes. This script runs the project's checks itself; when
+//           all pass, no model is called. When one fails, Claude (Sonnet, low effort) gets
+//           the failing output and fixes only lint, formatting and type errors, then the
+//           checks run again. Report: .codex/verify/last.log
 //   Step B  alignment review, report-only (Sonnet, medium effort; Opus for risky work).
 //           Judges the change against its plan phase and ends with a VERDICT line.
 //           It has no write tools. Report: .codex/verify/alignment.md
@@ -270,24 +272,55 @@ function planLabel(ctx) {
   return ctx.plan ? `${ctx.plan.rel} (phase ${ctx.plan.phase})` : "(none)";
 }
 
-function checksPrompt(checks) {
-  const runStep = checks.length
-    ? `2. Run these checks, in order:\n${checks.map((check) => `   - \`${check}\``).join("\n")}`
-    : "2. No checks are configured for this repo. Say in the report that no checks ran (add .codex/verify.json to define them).";
-  return `Codex just finished a turn in this repo. Run its checks and fix only mechanical failures.
-1. ${diffNote} Skim it so you know what changed.
-${runStep}
-3. Fix only lint, formatting and type errors, then re-run the checks until they pass or only
-   other failures remain. If a test, build or behavior fails for any other reason, do not fix
-   it: report the command and the error. Don't revert Codex's work to make checks pass.
+// Step A runs the checks itself, in Node, and only calls Claude when one fails: a passing
+// run costs no model tokens. Claude then gets just the failing commands and their output.
+function fixPrompt(failures) {
+  const failed = failures.map((f) => `### \`${f.cmd}\` (${f.status})\n${f.tail || "(no output)"}`).join("\n\n");
+  return `Codex just finished a turn in this repo and these project checks failed:
+
+${failed}
+
+1. ${diffNote} Read only the parts you need to fix a failure.
+2. Fix only lint, formatting and type errors, then re-run only the failing commands until they
+   pass or only other failures remain. If a test, build or behavior fails for any other reason,
+   do not fix it: report the command and the error. Don't revert Codex's work to make checks pass.
    If a check fails under Bash with a process-start error (such as 0xc0000142 on Windows),
    re-run that check with the PowerShell tool before treating it as a real failure.
-4. If the change adds an impeccable live-mode block (\`impeccable-live-start\` markers or a
-   localhost live.js script), don't remove it. Report it at the top as "must remove before commit".
-5. Don't judge whether the change matches its plan. A separate review step does that.
-6. Never run git commit, git add or git push. The user commits by hand.
-End with a short report: each check's command and final result, the files you changed, and
+3. Don't judge whether the change matches its plan. A separate review step does that.
+4. Never run git commit, git add or git push. The user commits by hand.
+End with a short report: each command you re-ran and its result, the files you changed, and
 the failures you left for rework.`;
+}
+
+const checkTimeoutMs = 15 * 60 * 1000;
+
+function runChecks(checks) {
+  return checks.map((cmd) => {
+    const result = spawnSync(cmd, {
+      cwd: repoRoot,
+      shell: true,
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: checkTimeoutMs,
+    });
+    const ok = result.status === 0 && !result.error;
+    const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+    const status = result.error ? (result.error.code === "ETIMEDOUT" ? "timed out" : result.error.message) : `exit ${result.status}`;
+    return { cmd, ok, status, tail: ok ? "" : tail(output, 2500) };
+  });
+}
+
+function checksReport(results, fixerReport) {
+  const lines = results.length
+    ? results.map((r) => `- \`${r.cmd}\`: ${r.ok ? "PASS" : `FAIL (${r.status})`}${r.ok || !r.tail ? "" : `\n${r.tail.replace(/^/gm, "    ")}`}`)
+    : ["- No checks are configured for this repo, so none ran (add .codex/verify.json to define them)."];
+  return [`Checks run by the verify script:`, ...lines, ...(fixerReport ? ["", "Claude fix step:", fixerReport] : [])].join("\n");
+}
+
+// Deterministic: flag an Impeccable live-mode block the change adds, in the diff's added lines.
+function addsLiveBlock(diff) {
+  return diff.split("\n").some((line) => line.startsWith("+") && /impeccable-live-start|localhost[^\s"']*\/live\.js/.test(line));
 }
 
 function alignmentPrompt(ctx, checksReport) {
@@ -342,49 +375,62 @@ function runVerification() {
   const range = `${ctx.base.tree.slice(0, 7)} (${ctx.base.from}) -> working tree`;
   writeDiff(ctx.base.tree, ctx.current);
 
-  const log = fs.openSync(logPath, "w");
-  fs.writeSync(log, `Claude verification started ${new Date().toISOString()}\n`);
-  fs.writeSync(log, `Range: ${range} | Plan: ${planLabel(ctx)}\n`);
-  fs.writeSync(log, `Step A checks: ${checks.length ? checks.join(" | ") : "(none configured)"}\n`);
-  fs.writeSync(log, `Step B alignment: ${modelLine}\n\n`);
-  const headerLines = 5;
-
-  const stepA = spawnSync(
-    "claude",
-    ["-p", checksPrompt(checks), "--model", "sonnet", "--effort", "low", "--permission-mode", "acceptEdits", "--allowedTools", ...checksTools(checks)],
-    { cwd: repoRoot, stdio: ["ignore", log, log], windowsHide: true },
+  fs.writeFileSync(
+    logPath,
+    [
+      `Claude verification started ${new Date().toISOString()}`,
+      `Range: ${range} | Plan: ${planLabel(ctx)}`,
+      `Step A checks: ${checks.length ? checks.join(" | ") : "(none configured)"}`,
+      `Step B alignment: ${modelLine}`,
+      "",
+      "",
+    ].join("\n"),
   );
-  fs.closeSync(log);
-  if (stepA.error) {
-    fs.appendFileSync(logPath, `\nFailed to start claude: ${stepA.error.message}\n`);
+
+  const task = ctx.plan ? path.basename(ctx.plan.rel, ".md") : "";
+  const liveBlock = addsLiveBlock(lib.diffText(repoRoot, ctx.base.tree, ctx.current));
+
+  // Step A: run the checks in Node. Claude is called only to fix a failure.
+  let results = runChecks(checks);
+  let fixerReport = "";
+  let fixerError = null;
+  if (results.some((r) => !r.ok)) {
+    const failures = results.filter((r) => !r.ok);
+    const fix = lib.runClaude(repoRoot, {
+      name: "checks-fix",
+      task,
+      prompt: fixPrompt(failures),
+      model: "sonnet",
+      effort: "low",
+      permissionMode: "acceptEdits",
+      allowed: checksTools(checks),
+    });
+    fixerError = fix.error || null;
+    fixerReport = fixerError ? `Failed to start claude: ${fixerError.message}` : tail(fix.text, 1500);
+    if (!fixerError) results = runChecks(checks);
   }
+  const checksText = [liveBlock ? "MUST REMOVE BEFORE COMMIT: the change adds an Impeccable live-mode block.\n" : "", checksReport(results, fixerReport)].join("");
+  fs.appendFileSync(logPath, `${checksText}\n`);
+  const checksStatus = checks.length === 0 ? "none" : results.every((r) => r.ok) ? "pass" : "fail";
 
   // Step B reviews the tree as Step A left it.
   const reviewed = lib.snapshot(repoRoot);
   writeDiff(ctx.base.tree, reviewed);
 
   let verdict = "";
-  if (!stepA.error) {
-    const checksReport = tail(readFile(logPath).split("\n").slice(headerLines).join("\n"), 3000);
-    const stepB = spawnSync(
-      "claude",
-      [
-        "-p",
-        alignmentPrompt(ctx, checksReport),
-        "--model",
-        model,
-        "--effort",
-        ctx.config.effort,
-        "--allowedTools",
-        ...alignmentTools,
-        "--disallowedTools",
-        ...alignmentDenied,
-      ],
-      { cwd: repoRoot, encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 },
-    );
-    const report =
-      (stepB.stdout || "").trim() ||
-      (stepB.error ? `Failed to start claude: ${stepB.error.message}` : (stepB.stderr || "").trim());
+  let reviewStarted = false;
+  if (!fixerError) {
+    const stepB = lib.runClaude(repoRoot, {
+      name: "alignment",
+      task,
+      prompt: alignmentPrompt(ctx, tail(checksText, 3000)),
+      model,
+      effort: ctx.config.effort,
+      allowed: alignmentTools,
+      denied: alignmentDenied,
+    });
+    reviewStarted = !stepB.error;
+    const report = stepB.text || (stepB.error ? `Failed to start claude: ${stepB.error.message}` : stepB.stderr);
     const verdicts = [...report.matchAll(/^[\s*_`>]*VERDICT:\s*(PASS|NEEDS REWORK)/gim)];
     verdict = verdicts.length ? verdicts[verdicts.length - 1][1].toUpperCase() : "";
     const header = [
@@ -394,7 +440,7 @@ function runVerification() {
       `- Model: ${modelLine}`,
       `- Plan: ${planLabel(ctx)}`,
       `- Range: ${ctx.base.tree} (${ctx.base.from}) -> ${reviewed} (working tree)`,
-      `- Verdict: ${verdict || "none (treated as NEEDS REWORK)"}`,
+      `- Verdict: ${verdict || (reviewStarted ? "none (treated as NEEDS REWORK)" : "none (claude did not start)")}`,
       "",
       "---",
       "",
@@ -411,13 +457,13 @@ function runVerification() {
     verifiedTree: nextBase,
     verifiedHead: ctx.head,
     fingerprint: `${nextBase}:${reviewed}`,
-    lastVerdict: verdict || (stepA.error ? "NOT RUN" : "NEEDS REWORK"),
+    lastVerdict: verdict || (reviewStarted ? "NEEDS REWORK" : "NOT RUN"),
     lastPlan: planLabel(ctx),
     reported: false,
   });
   fs.appendFileSync(
     logPath,
-    `\nFinished ${new Date().toISOString()} (exit ${stepA.status ?? "?"}) | Alignment verdict: ${verdict || "none"}, see ${path.relative(repoRoot, alignmentPath)}\n`,
+    `\nFinished ${new Date().toISOString()} | Checks: ${checksStatus} | Alignment verdict: ${verdict || "none"}, see ${path.relative(repoRoot, alignmentPath)}\n`,
   );
   fs.rmSync(lockPath, { force: true });
 }

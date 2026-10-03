@@ -42,8 +42,8 @@
   - Every phase has a gate: a runnable command, not a description.
   - A phase may suggest a commit message for the user (`**Suggested commit:**`).
   - Backend phases list expected files and dependents from `graphify query`.
-  - UI phases name the Impeccable command to run, and the Playwright spec if the
-    project has one.
+  - UI phases name the Impeccable command to run (only if Impeccable is installed), and
+    the Playwright spec if the project has one.
   - Requested browser acceptance steps name the app startup command, URL, interactions,
     viewport sizes and expected results. Playwright MCP is available after machine
     setup; it does not create project test specs. Use executable tests for phase gates.
@@ -61,9 +61,10 @@
   Claude runs in the background. In a one-paste run, `autopilot.js verify` calls the same
   script after each phase instead, and the Stop hook stays quiet. The
   change under review is written to `.codex/verify/phase.diff`.
-  - **Step A, checks** (Sonnet, low effort): runs the project's checks (auto-detected,
-    or `checks` in `.codex/verify.json`). It fixes only lint, formatting and type
-    errors, and reports other failures. Report: `.codex/verify/last.log`.
+  - **Step A, checks:** the script runs the project's checks (auto-detected, or `checks`
+    in `.codex/verify.json`) itself. Only if one fails, Claude (Sonnet, low effort) fixes
+    lint, formatting and type errors and reports other failures, then the checks re-run.
+    Report: `.codex/verify/last.log`.
   - **Step B, alignment** (Sonnet, medium effort, or Opus when the plan has `risk: high`
     or the diff touches `alignment.riskPaths` in `.codex/verify.json`): report-only, with no
     write tools. It lists DONE / PARTIAL / MISSING / OUT OF SCOPE / GATE / RISKS for
@@ -75,10 +76,13 @@
   directly instead of sending them back to Codex, and re-runs the checks until they
   pass. Behavior failures and NEEDS REWORK findings go back into the plan as rework
   for Codex.
-- **Design:** For UI work, Claude uses the impeccable skill (`/impeccable <command>`).
-  `PRODUCT.md` and `DESIGN.md` are the design context. As orchestrator, Claude's UI plans
-  name the impeccable command Codex should run and the DESIGN.md sections to follow.
-  Never commit impeccable's live-mode block (`impeccable-live-start` …
+- **Design:** Impeccable is optional. It is installed when `/impeccable` is available or
+  the project has `.impeccable/`. If it is installed, Claude uses it for UI work
+  (`/impeccable <command>`); `PRODUCT.md` and `DESIGN.md` are the design context, and as
+  orchestrator Claude's UI plans name the impeccable command Codex should run and the
+  DESIGN.md sections to follow. If it isn't installed, follow the project's existing
+  design conventions and don't mention impeccable commands in plans. Either way, never
+  commit impeccable's live-mode block (`impeccable-live-start` …
   `impeccable-live-end` in the root layout).
 
 Use Playwright MCP for browser acceptance checks requested by the user or approved

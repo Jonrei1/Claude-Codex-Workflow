@@ -18,11 +18,11 @@ The workflow supports new or existing repositories and detects checks for severa
 | Codex CLI | Implements approved phases, runs gates and fixes findings | Carries a task through every phase from one handoff; optional plan review checks assumptions before implementation. |
 | Playwright MCP + Chromium | Browser tools available to both agents | Enables requested inspection of a running app: navigation, clicks, forms, browser errors, screenshots and different viewport sizes. |
 | graphify | Shared codebase knowledge graph and search/read hooks | Helps find affected modules and dependents before editing, so plans include relevant files and checks. |
-| Impeccable | Design skills and UI feedback hooks | Uses `PRODUCT.md` and `DESIGN.md` to guide UI work and flag design issues during implementation. |
+| Impeccable (optional) | Design skills and UI feedback hooks | Uses `PRODUCT.md` and `DESIGN.md` to guide UI work and flag design issues during implementation. |
 | caveman | Optional terse replies | Reduces prose output; file reads, reasoning, tool results and reviews still consume usage. No fixed percentage saving is guaranteed. |
 | Autopilot helper and verification hook | Local Node scripts under `.codex/` | Track snapshots, run gates, launch reviews, record verdicts and close tasks. The scripts coordinate agents; they are not another model. |
 
-For example, for a checkout-page change, Claude can identify dependencies with graphify and specify the design using Impeccable. Codex implements the phases and uses Playwright to check requested interactions in the running app. Gates run executable assertions, and Claude reviews the diff against the plan.
+For example, for a checkout-page change, Claude can identify dependencies with graphify and, if you installed the optional Impeccable, specify the design with it. Codex implements the phases and uses Playwright to check requested interactions in the running app. Gates run executable assertions, and Claude reviews the diff against the plan.
 
 ## Install once, configure each project
 
@@ -31,7 +31,7 @@ For example, for a checkout-page change, Claude can identify dependencies with g
 - Node.js and npm, with `npx` available. The installer requires Node 18+, but **use a current supported Node LTS for browser tooling**; current Playwright Test documentation lists Node 22/24/26.
 - Git and a repository for project setup. Scaffold a new app and run `git init` yourself before setup.
 - Claude and Codex accounts or supported API authentication. Installing the CLIs does not sign you in or include model usage.
-- `uv`, `pipx`, or Python if graphify needs installing.
+- `uv`, `pipx`, or Python if graphify needs installing. For a global (all users) graphify install, Python's `pip` and administrator/root rights.
 
 Use a supported operating system for browser tooling. See the official [Playwright installation requirements](https://playwright.dev/docs/intro#system-requirements) for the current platform list.
 
@@ -50,7 +50,14 @@ Open the target project and run:
 /claude-codex-workflow:setup --yes
 ```
 
-`--yes` approves missing global tool installations, Chromium download and missing Playwright MCP registrations. Without it, a terminal installer prompts. A headless Claude command cannot prompt and reports incomplete steps for you to address.
+Before running the installer, Claude asks you two questions, because the installer itself cannot prompt from inside Claude:
+
+| Question | Asked when | Your choices |
+|---|---|---|
+| Install **Impeccable** (design skills and UI hooks)? | Always, unless you passed `--impeccable` or `--skip-impeccable` | Yes adds `--impeccable`; no adds `--skip-impeccable`. Optional, mainly useful for UI work. |
+| Install **graphify** for your user only, or globally? | Only when graphify isn't installed and you didn't pass `--graphify-scope` | **User** (recommended): into your home directory with `uv tool`, `pipx` or `pip --user`, no admin rights. **Global**: system-wide `pip`, shared by every user, usually needs admin/root rights. |
+
+`--yes` approves missing global tool installations (Claude Code and Codex CLI through npm), the Chromium download and missing Playwright MCP registrations. It does not answer the two questions above. The terminal installer asks them itself, with Impeccable defaulting to no and graphify defaulting to user. With `--yes`, `--dry-run` or no terminal, it skips Impeccable and uses the user scope for graphify. A headless Claude command cannot prompt and reports incomplete steps for you to address.
 
 ### Without the plugin
 
@@ -76,11 +83,11 @@ The machine tools are shared across projects. Run full setup once on each develo
 | Agent CLIs | Installs missing `@anthropic-ai/claude-code` and `@openai/codex` through npm | Global npm packages |
 | Playwright | Installs missing `@playwright/mcp`, locates its bundled Playwright dependency, and downloads matching Chromium if absent | Global npm package and user browser cache |
 | Browser connections | Adds missing `playwright` MCP registrations for Claude in user scope and Codex in user config | `~/.claude.json` and `~/.codex/config.toml`, shared across projects |
-| graphify | Installs with `uv`, then `pipx`, then user-level Python pip as available | Your machine |
+| graphify | If missing, asks for scope. **User** (default): `uv tool`, then `pipx`, then `pip --user`. **Global**: system-wide `pip install`, usually needing admin/root | Your user directory, or system-wide for global |
 | Helpers | Copies or updates workflow-owned Node scripts | `.codex/autopilot.js` and `.codex/hooks/` |
 | Instructions and hooks | Merges workflow sections and hook groups, retaining existing entries | `CLAUDE.md`, `AGENTS.md`, `.codex/hooks.json` |
 | Templates and skills | Creates missing plan template, task directory and caveman skills | `plans/`, `docs/tasks/`, `.claude/skills/`, `.agents/skills/` |
-| Project integrations | Runs graphify's agent installers and `npx -y impeccable install --project --providers=claude,codex` | Project instructions, design skills and hooks |
+| Project integrations | Runs graphify's agent installers. Only if you opt in, also runs `npx -y impeccable install --project --providers=claude,codex` | Project instructions; with Impeccable, design skills and hooks |
 | Ignores and checks | Adds workflow-state ignores and prints detected verification commands | `.gitignore` and installer output |
 
 Re-running updates workflow-owned `.codex/` scripts. Existing instruction sections are retained unless you pass `--update-sections`; existing customized plan and caveman templates are kept. Existing Playwright registrations are preserved and matching Chromium is reused. Keeping an existing registration does not prove it connects successfully; check `/mcp`.
@@ -89,14 +96,16 @@ Re-running updates workflow-owned `.codex/` scripts. Existing instruction sectio
 
 | Flag | Effect |
 |---|---|
-| `--yes` | Approve missing machine tools and Playwright setup without installer prompts. |
+| `--yes` | Approve missing machine tools and Playwright setup without installer prompts. Doesn't install Impeccable, and graphify uses the user scope. |
 | `--dry-run` | Print intended actions without installing or writing files/configuration. |
 | `--tools-only` | Set up machine tools, Chromium and Playwright registrations; skip project files and integrations. |
 | `--project-only` | Configure the project using existing tools; skip machine installations, Chromium download and MCP registration. |
 | `--skip-playwright` | Skip Playwright package, browser download and both registrations. |
+| `--graphify-scope=user` or `global` | Choose where a missing graphify is installed without being asked. Default `user`; `global` is system-wide `pip` and usually needs admin/root rights. |
 | `--skip-graphify` | Skip graphify's project integrations; the tools stage still checks/installs graphify. |
-| `--skip-impeccable` | Skip Impeccable project installation. |
-| `--impeccable-providers=codex` | Install design skills only for Codex when Claude already uses the Impeccable plugin. |
+| `--impeccable` | Install Impeccable. Without it, a terminal installer asks; `--yes`, `--dry-run` and a non-interactive run skip it. |
+| `--skip-impeccable` | Don't install Impeccable and don't ask. |
+| `--impeccable-providers=codex` | Implies `--impeccable`; installs design skills only for Codex when Claude already uses the Impeccable plugin. |
 | `--update-sections` | Replace existing workflow sections in `CLAUDE.md` and `AGENTS.md` with bundled versions. |
 | `--root <dir>` | Configure the Git repository containing that directory. |
 
@@ -106,9 +115,10 @@ Re-running updates workflow-owned `.codex/` scripts. Existing instruction sectio
 2. Restart both clients. Check `/mcp` for Playwright, and inspect registrations with `claude mcp get playwright` and `codex mcp get playwright`.
 3. Review and trust `.codex/hooks.json` in Codex using `/hooks` when needed. Later hook changes require trusting them again.
 4. Allow the helper's `verify`, `triage` and `close` commands network access and a long timeout when Codex requests approval: they start headless Claude sessions.
-5. Once the project has code, build the initial graph with `/graphify .` in Claude Code.
-6. Run `/impeccable init` for `PRODUCT.md`; for an existing UI, follow with `/impeccable document` for `DESIGN.md`. Use `/impeccable doctor` for an older design setup.
+5. Once the project has code, build the initial graph with `/graphify .` in Claude Code. If you chose a user-scope graphify and `graphify` isn't found, add `~/.local/bin` (or the Python user scripts folder) to `PATH`.
+6. If you installed Impeccable, run `/impeccable init` for `PRODUCT.md`; for an existing UI, follow with `/impeccable document` for `DESIGN.md`. Use `/impeccable doctor` for an older design setup.
 7. Review detected checks and add `.codex/verify.json` if they are missing or unsuitable.
+8. Optional: run `node .codex/autopilot.js usage` after a task to see headless Claude token usage and cost.
 
 ## Playwright browser tools
 
@@ -141,11 +151,11 @@ Minimal Linux systems may need OS libraries for Chromium. With administrator app
    ```
 
 4. **Preflight and optional plan review.** The helper validates phases and snapshots the working tree. Existing uncommitted work becomes the starting baseline. When enabled, Codex appends plan findings and headless Claude triages them before implementation.
-5. **Implement each phase.** Codex edits scoped files; the helper runs the gate. Gate failures return to Codex for fixes. After the gate passes, two headless Claude calls run in sequence:
+5. **Implement each phase.** Codex edits scoped files; the helper runs the gate. Gate failures return to Codex for fixes. After the gate passes, the verify script runs the checks (no model call) and then one headless Claude review:
 
    | Step | Default model / effort | Behavior | Report |
    |---|---|---|---|
-   | A: checks | Sonnet / low | Runs detected or configured checks; fixes lint, formatting and type errors; reports other failures. | `.codex/verify/last.log` |
+   | A: checks | None when checks pass; Sonnet / low only to fix a failure | The verify script runs detected or configured checks itself. If one fails, Claude fixes lint, formatting and type errors and reports other failures; the script then re-runs the checks. | `.codex/verify/last.log` |
    | B: alignment | Sonnet / medium; Opus for high risk or configured risk paths | Reads the plan and diff, reports completeness, scope, gates and risks, then returns `PASS` or `NEEDS REWORK`. Editing tools are denied. | `.codex/verify/alignment.md` |
 
    On `NEEDS REWORK`, Codex fixes findings and verifies again. After two reworks, another failed review stops the run as `stuck`. Each repeated review adds Claude usage. The verified snapshot advances only on `PASS`.
@@ -198,12 +208,14 @@ Claude and Codex have **separate usage accounting**. A Claude subprocess launche
 | Direct implementation in Claude | Reads, reasoning, edits and checks in that session | None unless Codex is separately requested |
 | Orchestrated planning | Plan creation and revisions | Optional plan review |
 | Phase implementation | Headless verification after passing gates | Implementation, gate fixes and review rework |
-| Verification | Step A + Step B per review attempt | Reading findings and fixing them |
+| Verification | Step B per review attempt, plus a Step A fix call when a check fails | Reading findings and fixing them |
 | Optional plan triage | One Sonnet / medium headless call | Plan review and reading the revised plan |
 | Task close | One Sonnet / low headless summary call | Closing coordination in the active session |
 | Browser inspection | Usage belongs to Claude when it drives Playwright | Usage belongs to Codex when it drives Playwright |
 
-For `P` phases and `R` additional verification attempts that reach Claude review, a successful orchestrated run normally starts **`2 × (P + R) + 1 + T` headless Claude calls**, where `T = 1` if plan triage runs, otherwise `0`. Three phases with no rework or triage mean seven headless Claude calls, plus interactive planning and Codex implementation. Gate failures occur before Claude review, so fixing one does not itself add two Claude calls. Interrupted calls can change these counts. Calls are not tokens: a call can contain multiple model turns and tool interactions.
+For `P` phases and `R` additional verification attempts that reach Claude review, a successful orchestrated run normally starts **`(P + R) + 1 + T` headless Claude calls** when checks pass, where `T = 1` if plan triage runs, otherwise `0`. Each attempt whose checks fail adds one more call, for the fix step. Three phases with no rework, failing checks or triage mean four headless Claude calls (three reviews and the close summary), plus interactive planning and Codex implementation. Gate failures occur before Claude review, so fixing one does not itself add Claude calls. Interrupted calls can change these counts. Calls are not tokens: a call can contain multiple model turns and tool interactions.
+
+Every headless call starts with only the built-in tools it needs (`--tools`) and no MCP servers (`--strict-mcp-config`). On a trivial prompt this cut a call's fixed input from about 37k to 14k tokens in a test run; your figure depends on your CLAUDE.md, skills, plugins and hooks. To also skip user-level settings, plugins and hooks, add `"headless": { "settingSources": "project,local" }` to `.codex/verify.json`. This is off by default because user settings can hold authentication or proxy environment.
 
 ### See your actual usage
 
@@ -216,7 +228,14 @@ For `P` phases and `R` additional verification attempts that reach Claude review
 
 See the official [Claude usage and cost guide](https://code.claude.com/docs/en/costs) and [Codex CLI command reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli). Availability varies by client version and authentication. Context occupancy is not cumulative consumption; an API-equivalent dollar estimate is not a subscription invoice.
 
-**The plugin saves plain-text reports, not a structured combined token ledger.** It does not collect every call's input, output, cache and reasoning counters or generate a per-task dollar total. To establish a measured baseline, record available counters before and after a representative task and include separate Claude headless sessions in account reporting. Concurrent work can affect account-level differences. Keep model names and cached-token categories alongside measurements, and avoid counting a session twice.
+**Headless Claude calls are logged; Codex and interactive sessions are not.** Each headless call appends its model, effort, input, cache and output tokens, turns and list-price cost to `.codex/verify/usage.jsonl`. Sum it with:
+
+```sh
+node .codex/autopilot.js usage                  # all tasks
+node .codex/autopilot.js usage plans/<task>.md  # one task
+```
+
+Input counts fresh, cache-written and cache-read tokens together, summed over each call's turns. The dollar figure is the API list price, not a subscription invoice. Codex usage and your interactive planner session are not in this log, so compare them through each client's own usage view. To establish a baseline, run a representative task and keep the usage summary alongside those figures. Concurrent work can affect account-level differences, and avoid counting a session twice.
 
 ### What increases usage, and what helps
 
