@@ -285,6 +285,20 @@ function mergeHooks(root, graphify, label) {
     return record(`.codex/hooks.json${label}`, false, "isn't valid JSON; merge templates/codex/hooks.json by hand");
   }
   config.hooks = config.hooks || {};
+  let repaired = 0;
+  const impeccableWindows = 'cmd.exe /d /c "if exist .agents\\skills\\impeccable\\scripts\\impeccable.cmd .agents\\skills\\impeccable\\scripts\\impeccable.cmd hook"';
+  for (const groups of Object.values(config.hooks)) {
+    for (const group of groups) {
+      for (const hook of group.hooks || []) {
+        if (hook.type !== "command") continue;
+        const commands = [hook.command, hook.commandWindows];
+        if (!commands.some((command) => typeof command === "string" && /\.agents\/skills\/impeccable\/scripts\/impeccable(?:\.cmd)?["']?\s+hook\b/.test(command.replace(/\\/g, "/")))) continue;
+        if (hook.commandWindows === impeccableWindows) continue;
+        hook.commandWindows = impeccableWindows;
+        repaired++;
+      }
+    }
+  }
   let added = 0;
   for (const [event, groups] of Object.entries(wanted.hooks)) {
     const existing = (config.hooks[event] = config.hooks[event] || []);
@@ -295,8 +309,8 @@ function mergeHooks(root, graphify, label) {
       added++;
     }
   }
-  if (!added) return record(`.codex/hooks.json${label}`, true, "verify and graphify hooks present");
-  write(file, JSON.stringify(config, null, 2) + "\n", `.codex/hooks.json${label}`, `added ${added} hook group(s); trust them again in Codex (/hooks)`);
+  if (!added && !repaired) return record(`.codex/hooks.json${label}`, true, "verify and graphify hooks present");
+  write(file, JSON.stringify(config, null, 2) + "\n", `.codex/hooks.json${label}`, `added ${added} hook group(s), repaired ${repaired} Impeccable Windows hook(s); trust them again in Codex (/hooks)`);
 }
 
 function updateGitignore(root) {

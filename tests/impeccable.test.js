@@ -64,6 +64,39 @@ test("workflow instructions treat Impeccable as optional", () => {
   assert.match(agents, /If the impeccable skill is installed/);
 });
 
+test("setup repairs existing Impeccable Windows hooks and preserves other hooks on rerun", () => {
+  const dir = gitRepo();
+  const file = path.join(dir, ".codex", "hooks.json");
+  const command = 'sh .agents/skills/impeccable/scripts/impeccable hook';
+  const unrelated = { type: "command", command: "echo custom", commandWindows: "echo windows" };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ hooks: { PostToolUse: [{ matcher: "Write|Edit", hooks: [
+    { type: "command", command, commandWindows: '.agents\\skills\\impeccable\\scripts\\impeccable.cmd hook', timeout: 10 },
+    unrelated,
+  ] }] } }));
+  const setup = () => {
+    const result = spawnSync(process.execPath, [installer, "--project-only", "--skip-graphify", "--skip-impeccable", "--root", dir], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+  };
+  setup();
+  const first = fs.readFileSync(file, "utf8");
+  const group = JSON.parse(first).hooks.PostToolUse[0];
+  assert.strictEqual(group.matcher, "Write|Edit");
+  assert.deepStrictEqual(group.hooks[0], {
+    type: "command", command, timeout: 10,
+    commandWindows: 'cmd.exe /d /c "if exist .agents\\skills\\impeccable\\scripts\\impeccable.cmd .agents\\skills\\impeccable\\scripts\\impeccable.cmd hook"',
+  });
+  assert.deepStrictEqual(group.hooks[1], unrelated);
+  if (process.platform === "win32") {
+    const result = spawnSync(group.hooks[0].commandWindows, { cwd: dir, shell: true, encoding: "utf8", windowsHide: true });
+    assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+  }
+  setup();
+  assert.strictEqual(fs.readFileSync(file, "utf8"), first);
+});
+
 test("graphify scope: user by default, global when asked", () => {
   const dir = gitRepo();
   const run = (extra) =>

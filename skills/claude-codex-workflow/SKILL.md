@@ -267,5 +267,5 @@ Also create an empty `docs/tasks/` folder (with a `.gitkeep`) for the task summa
 - **The graph is stale or missing:** Run `graphify update .`, or `/graphify .` in Claude Code for a full rebuild.
 - **Impeccable's hook never fires in Codex:** Approve the updated `hooks.json` with `/hooks`, then check the project's status with `/impeccable hooks status`.
 - **`npx impeccable install` fails with `Could not verify skill bundle: HTTP 404`:** The server couldn't serve the skill bundle, and nothing was installed. Retry later, or follow https://github.com/pbakaus/impeccable/issues/479.
-- **Impeccable's launcher fails on Windows:** Call `impeccable.cmd` instead of the `sh` launcher.
+- **Impeccable's launcher fails on Windows:** Re-run the workflow installer to repair existing Impeccable hooks. It sets `commandWindows` to `cmd.exe /d /c "if exist .agents\skills\impeccable\scripts\impeccable.cmd .agents\skills\impeccable\scripts\impeccable.cmd hook"`, which also succeeds when the launcher is absent.
 - **A `localhost:8400/live.js` script shows up in the app layout:** Live mode left its block behind. Delete everything between `impeccable-live-start` and `impeccable-live-end` before you commit.
