@@ -16,8 +16,8 @@
 // temporary index. A snapshot is a tree object, not a commit; it's on no branch and is
 // never pushed. Diffing two snapshots shows exactly what a phase changed.
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const { createRequire } = require("node:module");
@@ -537,77 +537,198 @@ function usageSummary(repoRoot, task) {
 
 // ---- Codex sessions ----------------------------------------------------------------------
 //
-// Codex records each session in $CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl (local date).
-// The first line is session_meta with the session id, cwd and source. The handoff posts
-// into the newest interactive session whose cwd is this repo, with `codex queue`.
+// Every Codex TUI (terminal or IDE) runs its threads on the shared local app-server daemon,
+// and `codex queue` posts into a thread through it. The daemon is also the only place that
+// knows which sessions are open right now: a session gets no rollout file or state row until
+// its first message. So the handoff asks the daemon, over `codex app-server proxy` (stdio
+// relayed to the control socket, which speaks JSON-RPC over WebSocket), for its loaded
+// threads and picks the newest one whose cwd is this repo.
 
-function codexHome() {
-  return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+// One WebSocket frame. Client frames are masked; server frames aren't.
+function encodeFrame(text, { mask = true } = {}) {
+  const payload = Buffer.from(text, "utf8");
+  const length = payload.length;
+  const header = length < 126 ? Buffer.alloc(2) : length < 65536 ? Buffer.alloc(4) : Buffer.alloc(10);
+  header[0] = 0x81;
+  if (length < 126) header[1] = length;
+  else if (length < 65536) {
+    header[1] = 126;
+    header.writeUInt16BE(length, 2);
+  } else {
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(length), 2);
+  }
+  if (!mask) return Buffer.concat([header, payload]);
+  header[1] |= 0x80;
+  const key = crypto.randomBytes(4);
+  return Buffer.concat([header, key, Buffer.from(payload.map((byte, i) => byte ^ key[i % 4]))]);
+}
+
+// Splits complete frames off the front of buffer: { frames: [{ opcode, text }], rest }.
+function decodeFrames(buffer) {
+  const frames = [];
+  for (;;) {
+    if (buffer.length < 2) break;
+    const masked = (buffer[1] & 0x80) !== 0;
+    let length = buffer[1] & 0x7f;
+    let offset = 2;
+    if (length === 126) {
+      if (buffer.length < 4) break;
+      length = buffer.readUInt16BE(2);
+      offset = 4;
+    } else if (length === 127) {
+      if (buffer.length < 10) break;
+      length = Number(buffer.readBigUInt64BE(2));
+      offset = 10;
+    }
+    const keyLength = masked ? 4 : 0;
+    if (buffer.length < offset + keyLength + length) break;
+    const key = buffer.subarray(offset, offset + keyLength);
+    let payload = buffer.subarray(offset + keyLength, offset + keyLength + length);
+    if (masked) payload = Buffer.from(payload.map((byte, i) => byte ^ key[i % 4]));
+    frames.push({ opcode: buffer[0] & 0x0f, text: payload.toString("utf8") });
+    buffer = buffer.subarray(offset + keyLength + length);
+  }
+  return { frames, rest: buffer };
+}
+
+// Runs JSON-RPC calls against the app-server daemon in order. Resolves to { results } (one
+// per call; a call's error lands as { error }) or { error } when the daemon can't be reached.
+function codexAppServer(calls, { timeoutMs = 10000, env } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(isWindows ? "codex app-server proxy" : "codex", isWindows ? [] : ["app-server", "proxy"], {
+        shell: isWindows,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+        ...(env ? { env } : {}),
+      });
+    } catch (error) {
+      resolve({ error: error.message });
+      return;
+    }
+    let settled = false;
+    let stderr = "";
+    let buffer = Buffer.alloc(0);
+    let upgraded = false;
+    let nextId = 0;
+    const pending = new Map();
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      for (const reject of pending.values()) reject(new Error("closed"));
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish({ error: `no answer from the Codex app-server within ${timeoutMs / 1000}s` }), timeoutMs);
+    const send = (message) => child.stdin.write(encodeFrame(JSON.stringify(message)));
+    const request = (method, params) =>
+      new Promise((resolveCall, rejectCall) => {
+        const id = ++nextId;
+        pending.set(id, rejectCall);
+        pending.set(`ok:${id}`, resolveCall);
+        send({ id, method, params });
+      });
+    const onMessage = (text) => {
+      let message;
+      try {
+        message = JSON.parse(text);
+      } catch {
+        return;
+      }
+      if (message.id === undefined || !pending.has(`ok:${message.id}`)) return;
+      const resolveCall = pending.get(`ok:${message.id}`);
+      pending.delete(message.id);
+      pending.delete(`ok:${message.id}`);
+      resolveCall(message);
+    };
+    const run = async () => {
+      try {
+        const init = await request("initialize", { clientInfo: { name: "claude-codex-workflow", version: "1" } });
+        if (init.error) return finish({ error: `initialize failed: ${init.error.message || JSON.stringify(init.error)}` });
+        send({ method: "initialized" });
+        const results = [];
+        for (const call of calls) {
+          const reply = await request(call.method, call.params || {});
+          results.push(reply.error ? { error: reply.error.message || JSON.stringify(reply.error) } : reply.result);
+        }
+        finish({ results });
+      } catch {
+        finish({ error: "the Codex app-server closed the connection" });
+      }
+    };
+    child.on("error", (error) => finish({ error: error.message }));
+    child.on("close", (code) => finish({ error: `codex app-server proxy exited with ${code}${stderr.trim() ? `: ${stderr.trim().split(/\r?\n/)[0]}` : ""}` }));
+    child.stdin.on("error", () => {});
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.stdout.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!upgraded) {
+        const end = buffer.indexOf("\r\n\r\n");
+        if (end === -1) return;
+        const status = buffer.subarray(0, end).toString("utf8").split("\r\n")[0];
+        buffer = buffer.subarray(end + 4);
+        if (!/^HTTP\/1\.1 101\b/.test(status)) return finish({ error: `the Codex app-server refused the connection (${status})` });
+        upgraded = true;
+        run();
+      }
+      const { frames, rest } = decodeFrames(buffer);
+      buffer = rest;
+      for (const frame of frames) if (frame.opcode === 1) onMessage(frame.text);
+    });
+    const key = crypto.randomBytes(16).toString("base64");
+    child.stdin.write(`GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+  });
+}
+
+// Threads loaded in the daemon right now: { threads } or { error }.
+async function liveCodexThreads(options = {}) {
+  const list = await codexAppServer([{ method: "thread/loaded/list" }], options);
+  if (list.error) return { error: list.error };
+  const ids = (list.results[0] && list.results[0].data) || [];
+  if (!ids.length) return { threads: [] };
+  const read = await codexAppServer(ids.map((threadId) => ({ method: "thread/read", params: { threadId, includeTurns: false } })), options);
+  if (read.error) return { error: read.error };
+  const threads = read.results.map((result) => result && result.thread).filter(Boolean);
+  return { threads };
 }
 
 function samePath(a, b) {
-  const normal = (p) => path.resolve(p).replace(/[\\/]+$/, "");
+  const normal = (p) => path.resolve(String(p).replace(/^\\\\\?\\/, "")).replace(/[\\/]+$/, "");
   return isWindows ? normal(a).toLowerCase() === normal(b).toLowerCase() : normal(a) === normal(b);
 }
 
-function firstLine(file, limit = 4 * 1024 * 1024) {
-  const fd = fs.openSync(file, "r");
-  try {
-    const chunks = [];
-    const buffer = Buffer.alloc(64 * 1024);
-    let total = 0;
-    for (;;) {
-      const read = fs.readSync(fd, buffer, 0, buffer.length, total);
-      if (read <= 0) break;
-      const chunk = buffer.subarray(0, read);
-      const newline = chunk.indexOf(10);
-      chunks.push(Buffer.from(newline === -1 ? chunk : chunk.subarray(0, newline)));
-      total += read;
-      if (newline !== -1 || total >= limit) break;
-    }
-    return Buffer.concat(chunks).toString("utf8");
-  } finally {
-    fs.closeSync(fd);
-  }
+// The user's own sessions in repoRoot, newest first. Skips headless `codex exec` runs,
+// subagents and Codex's side threads (titles and the like are ephemeral, threadSource
+// other than "user").
+function pickCodexSession(threads, repoRoot) {
+  const matches = (threads || [])
+    .filter((thread) => thread && thread.id && thread.cwd && samePath(thread.cwd, repoRoot))
+    .filter((thread) => thread.source !== "exec" && !thread.parentThreadId && !thread.ephemeral)
+    .filter((thread) => !thread.threadSource || thread.threadSource === "user")
+    .map((thread) => ({
+      id: thread.id,
+      cwd: thread.cwd,
+      source: thread.source || "",
+      status: (thread.status && thread.status.type) || "",
+      name: thread.name || "",
+      at: thread.recencyAt || thread.updatedAt || thread.createdAt || 0,
+    }))
+    .sort((a, b) => b.at - a.at);
+  return { session: matches[0] || null, others: matches.slice(1) };
 }
 
-// The newest interactive Codex session for repoRoot: { id, source, file, mtime } or null.
-// Non-interactive `codex exec` sessions (source "exec") are skipped.
-function findCodexSession(repoRoot, { home = codexHome(), days = 7, now = Date.now() } = {}) {
-  const pad = (n) => String(n).padStart(2, "0");
-  const files = [];
-  for (let d = 0; d < days; d++) {
-    const date = new Date(now - d * 24 * 60 * 60 * 1000);
-    const dir = path.join(home, "sessions", String(date.getFullYear()), pad(date.getMonth() + 1), pad(date.getDate()));
-    let names = [];
-    try {
-      names = fs.readdirSync(dir);
-    } catch {
-      continue;
-    }
-    for (const name of names) {
-      if (!/^rollout-.*\.jsonl$/.test(name)) continue;
-      const file = path.join(dir, name);
-      try {
-        files.push({ file, mtime: fs.statSync(file).mtimeMs });
-      } catch {
-        // removed while scanning
-      }
-    }
-  }
-  files.sort((a, b) => b.mtime - a.mtime);
-  for (const { file, mtime } of files) {
-    let meta;
-    try {
-      meta = JSON.parse(firstLine(file));
-    } catch {
-      continue;
-    }
-    const payload = meta && meta.type === "session_meta" ? meta.payload || {} : null;
-    if (!payload || !payload.cwd || payload.source === "exec" || /exec/.test(payload.originator || "")) continue;
-    if (samePath(payload.cwd, repoRoot)) return { id: payload.id || payload.session_id, source: payload.source || "", file, mtime };
-  }
-  return null;
+// The open Codex session for repoRoot: { session, others } or { session: null, error }.
+async function findCodexSession(repoRoot, options = {}) {
+  const live = await liveCodexThreads(options);
+  if (live.error) return { session: null, others: [], error: live.error };
+  return pickCodexSession(live.threads, repoRoot);
 }
 
 // ---- Playwright --------------------------------------------------------------------------
@@ -681,7 +802,11 @@ module.exports = {
   gateProblem,
   planChecklist,
   planProblems,
-  codexHome,
+  encodeFrame,
+  decodeFrames,
+  codexAppServer,
+  liveCodexThreads,
+  pickCodexSession,
   findCodexSession,
   resolvePlaywright,
   playwrightMcpConfig,

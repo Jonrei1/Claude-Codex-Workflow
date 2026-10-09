@@ -213,27 +213,39 @@ test("gates must be runnable: unknown programs are reported", () => {
 
 // ---- Codex session discovery ----
 
-function fakeSession(home, id, cwd, { source = "cli", ageMs = 0 } = {}) {
-  const now = new Date(Date.now() - ageMs);
-  const pad = (n) => String(n).padStart(2, "0");
-  const dir = path.join(home, "sessions", String(now.getFullYear()), pad(now.getMonth() + 1), pad(now.getDate()));
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `rollout-${id}.jsonl`);
-  fs.writeFileSync(file, `${JSON.stringify({ type: "session_meta", payload: { id, cwd, source, originator: source === "exec" ? "codex_exec" : "codex-tui" } })}\n{}\n`);
-  const time = now.getTime() / 1000;
-  fs.utimesSync(file, time, time);
-  return file;
+// A thread as the Codex app-server's thread/read returns it.
+function liveThread(id, cwd, extra = {}) {
+  return { id, cwd, source: "vscode", status: { type: "idle" }, threadSource: "user", ephemeral: false, parentThreadId: null, createdAt: 1000, updatedAt: 1000, ...extra };
 }
 
-test("findCodexSession picks the newest interactive session for this repo", () => {
-  const home = tempDir("ccw-codex-home-");
+test("pickCodexSession picks the newest of the user's own sessions in the repo", () => {
   const repo = tempDir("ccw-repo-");
-  fakeSession(home, "old-match", repo, { ageMs: 60 * 60 * 1000 });
-  fakeSession(home, "new-match", isWindows ? repo.toUpperCase() : repo, { ageMs: 10 * 60 * 1000 });
-  fakeSession(home, "other-repo", path.join(repo, "..", "elsewhere"));
-  fakeSession(home, "headless", repo, { source: "exec" });
-  assert.strictEqual(lib.findCodexSession(repo, { home }).id, "new-match");
-  assert.strictEqual(lib.findCodexSession(path.join(repo, "..", "nowhere"), { home }), null);
+  const threads = [
+    liveThread("old-match", repo, { updatedAt: 1000 }),
+    liveThread("new-match", isWindows ? `\\\\?\\${repo.toUpperCase()}` : repo, { updatedAt: 3000 }),
+    liveThread("other-repo", path.join(repo, "..", "elsewhere"), { updatedAt: 9000 }),
+    liveThread("headless", repo, { source: "exec", updatedAt: 9000 }),
+    liveThread("subagent", repo, { parentThreadId: "new-match", updatedAt: 9000 }),
+    liveThread("title", repo, { ephemeral: true, threadSource: "thread_title", updatedAt: 9000 }),
+  ];
+  const { session, others } = lib.pickCodexSession(threads, repo);
+  assert.strictEqual(session.id, "new-match");
+  assert.strictEqual(session.status, "idle");
+  assert.deepStrictEqual(others.map((other) => other.id), ["old-match"]);
+  assert.strictEqual(lib.pickCodexSession(threads, path.join(repo, "..", "nowhere")).session, null);
+});
+
+test("WebSocket frames round-trip at every length encoding", () => {
+  for (const size of [5, 300, 70000]) {
+    const text = "x".repeat(size);
+    for (const mask of [true, false]) {
+      const frame = lib.encodeFrame(text, { mask });
+      const { frames, rest } = lib.decodeFrames(Buffer.concat([frame, frame.subarray(0, 1)]));
+      assert.strictEqual(frames.length, 1);
+      assert.strictEqual(frames[0].text, text);
+      assert.strictEqual(rest.length, 1);
+    }
+  }
 });
 
 // ---- autopilot handoff and wait ----
@@ -265,69 +277,84 @@ test("handoff --print exits 5 with the paste line", () => {
   assert.match(result.stdout, /Execute \.codex\/plans\/add-badge\.md\. Follow \.codex\/workflow\/CODEX\.md, section Full plan execution\./);
 });
 
-// A codex shim that records its arguments in args.txt and exits with `code`.
-function fakeCodex(code = 0) {
+// A codex stand-in (tests/fixtures/fake-codex.js) on PATH. Its app-server serves the threads
+// in threadsFile; `queue` records its arguments in argsFile.
+function fakeCodex({ threads, queueCode = 0, proxyCode = 0 } = {}) {
   const bin = tempDir("ccw-bin-");
-  const argsFile = path.join(bin, "args.txt");
-  if (isWindows) fs.writeFileSync(path.join(bin, "codex.cmd"), `@echo off\r\necho %* > "${argsFile}"\r\nexit /b ${code}\r\n`);
+  const config = { threadsFile: path.join(bin, "threads.json"), argsFile: path.join(bin, "args.txt"), queueCode, proxyCode };
+  fs.writeFileSync(path.join(bin, "config.json"), JSON.stringify(config));
+  if (threads) fs.writeFileSync(config.threadsFile, JSON.stringify(threads));
+  const script = path.join(__dirname, "fixtures", "fake-codex.js");
+  if (isWindows) fs.writeFileSync(path.join(bin, "codex.cmd"), `@"${process.execPath}" "${script}" "${path.join(bin, "config.json")}" %*\r\n`);
   else {
-    fs.writeFileSync(path.join(bin, "codex"), `#!/bin/sh\necho "$@" > "${argsFile}"\nexit ${code}\n`);
+    fs.writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${script}" "${path.join(bin, "config.json")}" "$@"\n`);
     fs.chmodSync(path.join(bin, "codex"), 0o755);
   }
-  return { argsFile, env: { PATH: `${bin}${path.delimiter}${process.env.PATH}` } };
+  return { ...config, env: { PATH: `${bin}${path.delimiter}${process.env.PATH}` } };
 }
 
-test("handoff posts the plan into the repo's open Codex session with codex queue", () => {
+const liveId = "11111111-2222-3333-4444-555555555555";
+
+test("handoff sends the plan to the Codex session open in the repo, and names it", () => {
   const dir = workflowRepo();
-  const home = tempDir("ccw-codex-home-");
-  fakeSession(home, "11111111-2222-3333-4444-555555555555", dir);
-  const codex = fakeCodex();
-  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md"], { CODEX_HOME: home, ...codex.env });
+  const codex = fakeCodex({ threads: [liveThread(liveId, dir), liveThread("title-thread", dir, { ephemeral: true, threadSource: "thread_title", updatedAt: 5000 })] });
+  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md"], codex.env);
   assert.strictEqual(result.status, 0, result.stdout + result.stderr);
-  const sent = fs.readFileSync(codex.argsFile, "utf8");
-  assert.match(sent, /queue --thread 11111111-2222-3333-4444-555555555555 --message "?Execute \.codex\/plans\/add-badge\.md/);
+  assert.match(fs.readFileSync(codex.argsFile, "utf8"), new RegExp(`queue --thread ${liveId} --message "?Execute \\.codex/plans/add-badge\\.md`));
+  assert.match(result.stdout, new RegExp(`Sent to Codex session ${liveId} \\(vscode, idle\\) in `));
   const handoff = JSON.parse(read(dir, ".codex/autopilot/handoff.json"));
   assert.strictEqual(handoff.via, "codex queue");
+  assert.strictEqual(handoff.thread, liveId);
+  assert.strictEqual(handoff.source, "vscode");
 });
 
-test("handoff with no Codex session prints the paste line instead of opening a terminal", () => {
+test("handoff with no Codex session open prints the paste line instead of opening a terminal", () => {
   const dir = workflowRepo();
-  const codex = fakeCodex();
-  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md", "--wait", "0"], { CODEX_HOME: tempDir("ccw-codex-home-"), ...codex.env });
+  const codex = fakeCodex({ threads: [liveThread(liveId, path.join(dir, "..", "elsewhere"))] });
+  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md", "--wait", "0"], codex.env);
   assert.strictEqual(result.status, 5, result.stdout + result.stderr);
+  assert.match(result.stdout, /No Codex session is open in this repo\./);
   assert.match(result.stdout, /Paste this into Codex:\s+Execute \.codex\/plans\/add-badge\.md/);
-  assert.ok(!fs.existsSync(codex.argsFile), "codex should not be started");
+  assert.ok(!fs.existsSync(codex.argsFile), "nothing should be queued");
   assert.strictEqual(JSON.parse(read(dir, ".codex/autopilot/handoff.json")).via, "print");
 });
 
-test("handoff waits for the IDE's Codex session to appear, then queues into it", async () => {
+test("handoff waits for Codex to be started in the repo, then sends the plan to it", async () => {
   const dir = workflowRepo();
-  const home = tempDir("ccw-codex-home-");
   const codex = fakeCodex();
   const child = spawn(process.execPath, [path.join(dir, ".codex", "autopilot.js"), "handoff", ".codex/plans/add-badge.md", "--wait", "30"], {
     cwd: dir,
-    env: { ...process.env, CODEX_HOME: home, ...codex.env },
+    env: { ...process.env, ...codex.env },
   });
   let stdout = "";
   child.stdout.on("data", (chunk) => (stdout += chunk));
   child.stderr.on("data", (chunk) => (stdout += chunk));
-  setTimeout(() => fakeSession(home, "99999999-8888-7777-6666-555555555555", dir), 1000);
+  setTimeout(() => fs.writeFileSync(codex.threadsFile, JSON.stringify([liveThread(liveId, dir)])), 1000);
   const status = await new Promise((resolve) => child.on("close", resolve));
   assert.strictEqual(status, 0, stdout);
-  assert.match(stdout, /Send any message in your Codex terminal/);
-  assert.match(fs.readFileSync(codex.argsFile, "utf8"), /queue --thread 99999999-8888-7777-6666-555555555555/);
+  assert.match(stdout, /Start Codex in a terminal here/);
+  assert.match(fs.readFileSync(codex.argsFile, "utf8"), new RegExp(`queue --thread ${liveId}`));
   assert.strictEqual(JSON.parse(read(dir, ".codex/autopilot/handoff.json")).via, "codex queue");
 });
 
 test("handoff prints the paste line when codex queue fails", () => {
   const dir = workflowRepo();
-  const home = tempDir("ccw-codex-home-");
-  fakeSession(home, "11111111-2222-3333-4444-555555555555", dir);
-  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md"], { CODEX_HOME: home, ...fakeCodex(1).env });
+  const codex = fakeCodex({ threads: [liveThread(liveId, dir)], queueCode: 1 });
+  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md"], codex.env);
   assert.strictEqual(result.status, 5, result.stdout + result.stderr);
-  assert.match(result.stdout, /codex queue to 11111111-2222-3333-4444-555555555555 failed/);
+  assert.match(result.stdout, new RegExp(`codex queue to ${liveId} failed`));
   assert.match(result.stdout, /Paste this into Codex:/);
   assert.strictEqual(JSON.parse(read(dir, ".codex/autopilot/handoff.json")).via, "print");
+});
+
+test("handoff explains an unreachable Codex app-server and prints the paste line", () => {
+  const dir = workflowRepo();
+  const codex = fakeCodex({ proxyCode: 1 });
+  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md", "--wait", "0"], codex.env);
+  assert.strictEqual(result.status, 5, result.stdout + result.stderr);
+  assert.match(result.stdout, /Couldn't ask the Codex app-server for open sessions: codex app-server proxy exited with 1/);
+  assert.match(result.stdout, /Paste this into Codex:/);
+  assert.ok(!fs.existsSync(codex.argsFile), "nothing should be queued");
 });
 
 test("wait returns when the run is done, with a summary, and 4 when it's stuck", () => {

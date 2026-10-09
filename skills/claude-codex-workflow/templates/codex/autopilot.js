@@ -4,10 +4,10 @@
 // Autopilot: run an approved plan end to end, handed to Codex automatically.
 //
 // Claude saves the plan to .codex/plans/<slug>.md, runs `check`, then `handoff`, which posts
-// `Execute .codex/plans/<slug>.md ...` into the open Codex session for this repo (waiting for
-// one to appear, else printing the line to paste). Claude then runs `wait` in the background and reviews the
-// result when the run ends. Codex (following .codex/workflow/CODEX.md "Full plan
-// execution") calls the other steps from its own session:
+// `Execute .codex/plans/<slug>.md ...` into the Codex session open in this repo (found through
+// the Codex app-server; it waits for one, else prints the line to paste). Claude then runs
+// `wait` in the background and reviews the result when the run ends. Codex (following
+// .codex/workflow/CODEX.md "Full plan execution") calls the other steps from its own session:
 //
 //   node .codex/autopilot.js check   .codex/plans/<slug>.md      planning checklist (exit 1 if not runnable)
 //   node .codex/autopilot.js handoff .codex/plans/<slug>.md      send the plan to Codex [--phase N] [--continue]
@@ -502,27 +502,33 @@ function openTerminal(message) {
   return false;
 }
 
-function recordHandoff(via, thread, message) {
-  fs.writeFileSync(handoffPath, JSON.stringify({ slug, plan: planRel, via, thread: thread || "", message, at: new Date().toISOString() }, null, 2) + "\n");
+function recordHandoff(via, thread, message, session = {}) {
+  const record = { slug, plan: planRel, via, thread: thread || "", source: session.source || "", cwd: session.cwd || "", message, at: new Date().toISOString() };
+  fs.writeFileSync(handoffPath, JSON.stringify(record, null, 2) + "\n");
 }
 
-// Codex writes a session's rollout file only after its first message, so an idle Codex
-// terminal can't be found yet. Poll until the user sends it something or the time runs out.
+// Polls the Codex app-server until a session is open in this repo or the time runs out.
+// Returns the last lookup: { session, others } or { session: null, error }.
 async function waitForSession(seconds) {
   const deadline = Date.now() + seconds * 1000;
   for (;;) {
-    const session = lib.findCodexSession(repoRoot);
-    if (session || Date.now() >= deadline) return session;
+    const found = await lib.findCodexSession(repoRoot);
+    if (found.session || Date.now() >= deadline) return found;
     await new Promise((resolve) => setTimeout(resolve, Math.min(3000, Math.max(0, deadline - Date.now()))));
   }
 }
 
-function queueInto(thread, message) {
+function describeSession(session) {
+  const details = [session.source, session.status].filter(Boolean).join(", ");
+  return `${session.id}${details ? ` (${details})` : ""}${session.cwd ? ` in ${session.cwd}` : ""}`;
+}
+
+function queueInto(thread, message, session = { id: thread }) {
   const result = runCodex(["queue", "--thread", thread, "--message", message], { timeout: 60 * 1000, env: process.env });
   const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
   if (!result.error && result.status === 0 && !/^Error:/m.test(output)) {
-    recordHandoff("codex queue", thread, message);
-    console.log(`\nSent to Codex session ${thread}:\n  ${message}`);
+    recordHandoff("codex queue", thread, message, session);
+    console.log(`\nSent to Codex session ${describeSession(session)}:\n  ${message}`);
     return true;
   }
   console.log(`\ncodex queue to ${thread} failed${output ? `: ${tail(output, 500)}` : ""}.`);
@@ -555,21 +561,27 @@ async function cmdHandoff() {
   }
 
   const config = lib.verifyConfig(repoRoot).handoff || {};
-  let thread = flagValue("--thread") || config.thread || "";
-  if (!thread) {
-    let session = lib.findCodexSession(repoRoot);
-    if (!session) {
-      const seconds = Number(flagValue("--wait") || (config.waitSeconds ?? 90)) || 0;
-      if (seconds > 0) {
-        console.log(`\nNo Codex session for this repo yet. Send any message in your Codex terminal (e.g. "ready") and the plan will be queued into it. Waiting up to ${seconds}s...`);
-        session = await waitForSession(seconds);
-      }
+  const pinned = flagValue("--thread") || config.thread || "";
+  if (pinned) return queueInto(pinned, message) ? 0 : paste();
+
+  // Ask the Codex app-server which sessions are open in this repo. It sees a session as soon
+  // as Codex starts, before its first message.
+  let found = await lib.findCodexSession(repoRoot);
+  if (!found.session) {
+    const seconds = Number(flagValue("--wait") || (config.waitSeconds ?? 90)) || 0;
+    if (seconds > 0) {
+      console.log(`\nNo Codex session is open in this repo. Start Codex in a terminal here (your IDE's terminal is fine) and the plan will be sent to it. Waiting up to ${seconds}s...`);
+      found = await waitForSession(seconds);
     }
-    if (session) thread = session.id;
-    else console.log("\nNo Codex session found for this repo.");
   }
-  if (thread && queueInto(thread, message)) return 0;
-  return paste();
+  if (!found.session) {
+    console.log(found.error ? `\nCouldn't ask the Codex app-server for open sessions: ${found.error}` : "\nNo Codex session is open in this repo.");
+    return paste();
+  }
+  if (found.others.length) {
+    console.log(`\n${found.others.length + 1} Codex sessions are open in this repo; using the most recent. Others:\n${found.others.map((other) => `  ${describeSession(other)}`).join("\n")}\nPin one with --thread <id> or handoff.thread in .codex/verify.json.`);
+  }
+  return queueInto(found.session.id, message, found.session) ? 0 : paste();
 }
 
 // ---- wait: block until the run ends, then print what Claude needs to review ----

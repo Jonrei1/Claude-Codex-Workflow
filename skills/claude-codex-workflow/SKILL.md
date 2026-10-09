@@ -17,7 +17,7 @@ A reusable setup for any project, new or existing, on any stack, on Windows, mac
 - **Local only.** Plans (`.codex/plans/`), verify logs (`.codex/verify/<task>/`), task summaries (`.codex/tasks/`), the Claude rules (`CLAUDE.local.md`) and the Codex rules (`.codex/workflow/CODEX.md`) are hidden through `.git/info/exclude`. Setup never edits a tracked file, so teammates see no diff and there are no merge conflicts. `--shared` restores the old team-wide layout.
 - **Ask on every plan.** For every new plan that changes app code, Claude asks: Codex implements (Claude orchestrates), Claude implements, or Codex with manual phases.
 - **Criteria-checked plans.** As orchestrator, Claude writes a phased plan whose acceptance items have ids, and whose phases each declare Scope, Steps, Covers, Done when, Hands off (what the next phase relies on) and a runnable Gate. UI plans also carry a UI audit section. `autopilot.js check` enforces all of it before handoff.
-- **Automatic handoff.** `autopilot.js handoff` posts `Execute .codex/plans/<task>.md ...` into the open Codex session for the repo with `codex queue`. If the IDE's Codex terminal hasn't had a message yet, it waits for one. Nothing to paste.
+- **Automatic handoff.** `autopilot.js handoff` posts `Execute .codex/plans/<task>.md ...` into the Codex session open in the repo (terminal or IDE) with `codex queue`, and says which session it used. Nothing to paste.
 - **Automatic review.** Claude runs `autopilot.js wait` in the background. When Codex finishes, Claude reads the per-phase reports, runs a final Playwright UI audit for UI plans, and reports, without being asked.
 - **Parallel verification.** After each phase, Step A (checks, plus fixes for lint and type errors), Step B (alignment review) and Step C (Playwright UI audit, for UI phases) run at the same time in the background.
 - **No agent ever commits or pushes.** Every change stays in the working tree for you to review and commit. Progress is tracked with snapshots (git tree objects that aren't commits and aren't on any branch).
@@ -51,9 +51,10 @@ A reusable setup for any project, new or existing, on any stack, on Windows, mac
    - **Codex, manual phases:** the same plan, but Codex runs one phase per handoff, and the Codex Stop hook verifies each one.
    - **UI tasks:** if Impeccable is installed, Claude uses it (for example `/impeccable shape`). The plan names the Impeccable command Codex should run and the `DESIGN.md` sections to follow.
 2. **Handoff (automatic).** Claude runs `node .codex/autopilot.js handoff .codex/plans/<task>.md`:
-   - It looks for the newest interactive Codex session whose folder is this repo (from `$CODEX_HOME/sessions`, last 7 days) and posts the execute line into it with `codex queue`.
-   - Codex writes a session file only after the session's first message, so an idle Codex terminal can't be found yet. With no session, it asks the user to send any message in their Codex terminal and polls for up to 90 s (`--wait <seconds>`, or `handoff.waitSeconds` in `.codex/verify.json`), then queues into the session that appears.
-   - If no session appears, or `queue` fails, it prints the line to paste. It never opens a window on its own.
+   - It asks the Codex app-server daemon, which every Codex TUI (terminal or IDE) runs on, for the sessions open right now (`codex app-server proxy`, then `thread/loaded/list` and `thread/read`). It takes the newest one whose folder is this repo, skipping `codex exec` runs, subagents and Codex's side threads, and posts the execute line into it with `codex queue`. A session counts as soon as Codex starts. No first message is needed.
+   - The output names the session (`Sent to Codex session <id> (vscode, idle) in <folder>`). If several are open, it lists the others.
+   - With no session open, it waits up to 90 s for one (`--wait <seconds>`, or `handoff.waitSeconds` in `.codex/verify.json`).
+   - If no session appears, the app-server can't be reached, or `queue` fails, it prints the line to paste. It never opens a window on its own.
    - Exit 5 means it couldn't reach Codex and printed the line to paste.
    - `--thread <id>` (or `handoff.thread` in `.codex/verify.json`) pins the session, and `--new-terminal` skips the lookup and opens a new terminal running `codex "<line>"` (Windows Terminal or cmd, macOS Terminal, or `$TERMINAL`/x-terminal-emulator/gnome-terminal/konsole/xterm). `--phase N` sends a single phase (manual mode), and `--continue` resumes a stopped run.
    - It records what it did in `.codex/autopilot/handoff.json`.
@@ -178,7 +179,7 @@ With `--shared`, the old layout is used instead:
 
 1. **Restart Claude Code.** It loads `CLAUDE.local.md` and the plan hook at start.
 2. **Trust the hooks in Codex.** On the first Codex run in the project, Codex asks you to review and trust the hooks, or approve them with `/hooks`. Any later edit to a hooks file means trusting it again.
-3. **Keep a Codex session open in the repo.** That's where the handoff posts plans. In a fresh Codex terminal, send any message first so Codex records the session. Otherwise the handoff waits for one, then prints the line to paste.
+3. **Keep a Codex session open in the repo.** That's where the handoff posts plans. An IDE terminal is fine, and it doesn't need a message first. With none open, the handoff waits for one, then prints the line to paste.
 4. **Let the verify step run from Codex.** `autopilot.js verify`, `triage` and `close` start headless Claude runs, which need the network and several minutes. Approve them when Codex asks to run them outside the sandbox.
 5. If the detected checks are wrong or empty, add `.codex/verify.json` (see [Checks](#checks)). For UI work, add its `ui` block.
 6. Commit `PRODUCT.md`, `DESIGN.md`, `.impeccable/config.json` and `.impeccable/design.json` when they exist, if your team wants them shared.
@@ -288,8 +289,8 @@ About the hooks:
 
 - **The installer says a tool is missing but doesn't install it:** It only installs global tools after asking in a terminal, or with `--yes`. From Claude, re-run with `--yes`.
 - **A step says "tracked by git, left unchanged":** the file is committed in this repo. Nothing else is needed; the workflow uses its local equivalent. Use `--shared` only if the team wants the workflow committed.
-- **The plan didn't reach Codex:** `handoff` only posts to interactive Codex sessions from the last 7 days whose folder is this repo.
-  - Open one there, or pin one with `--thread <id>` or `handoff.thread`.
+- **The plan didn't reach Codex:** `handoff` only posts to a Codex session that is open right now in this repo, as reported by the Codex app-server daemon.
+  - Start Codex there, or pin one with `--thread <id>` or `handoff.thread`. If it says it couldn't ask the app-server, check `codex app-server daemon version`.
   - If `codex queue` isn't available in your Codex CLI, update Codex. `--new-terminal` works without it.
   - Exit 5 printed the line to paste.
 - **`wait` timed out (exit 6):** Codex never ran `begin`, or is still running. Check the Codex session, then wait again.
