@@ -160,7 +160,7 @@ Minimal Linux systems may need OS libraries for Chromium. With administrator app
    - for `ui: yes`, a `## UI audit` section and **UI audit** blocks on UI phases.
 
    High-risk work enables Codex plan review.
-3. **Automatic handoff.** Once you approve, Claude runs `node .codex/autopilot.js handoff .codex/plans/<task>.md`. It finds the newest interactive Codex session whose folder is this repo and posts `Execute .codex/plans/<task>.md ...` into it with `codex queue`. With no open session, it opens a new terminal running Codex. If neither works, it prints the line to paste. Claude then runs `autopilot.js wait` in the background and you can keep working.
+3. **Automatic handoff.** Once you approve, Claude runs `node .codex/autopilot.js handoff .codex/plans/<task>.md`. It finds the newest interactive Codex session whose folder is this repo and posts `Execute .codex/plans/<task>.md ...` into it with `codex queue`. Codex only records a session after its first message, so if your IDE's Codex terminal hasn't had one yet, it asks you to send any message there and waits up to 90 s (`--wait <seconds>`, or `handoff.waitSeconds` in `.codex/verify.json`). If no session turns up, it prints the line to paste. It never opens a new window unless you pass `--new-terminal`. Claude then runs `autopilot.js wait` in the background and you can keep working.
 4. **Preflight and optional plan review.** The helper validates phases and snapshots the working tree. Existing uncommitted work becomes the starting baseline. When enabled, Codex appends plan findings and headless Claude triages them before implementation.
 5. **Implement each phase.** Codex edits scoped files; the helper runs the gate. Gate failures return to Codex for fixes. After the gate passes, three verification steps start **in parallel**, so a phase takes as long as the slowest one:
 
@@ -278,7 +278,7 @@ Every artifact below is local to your clone and hidden through `.git/info/exclud
 | Artifact | Contents |
 |---|---|
 | `.codex/plans/<task>.md` | Approved requirements, phases, gates and plan findings. |
-| `.codex/autopilot/handoff.json` | How the last plan reached Codex (`codex queue` thread, new terminal, or paste). |
+| `.codex/autopilot/handoff.json` | How the last plan reached Codex (`codex queue` thread, paste, or new terminal with `--new-terminal`). |
 | `.codex/autopilot/status.json` | State (`running`, `done`, `stuck`, `failed`), phase, step, reason and per-phase verdicts. |
 | `.codex/autopilot/<task>.log` | Helper progress log. |
 | `.codex/verify/<task>/phase-<N>.*` | Per-phase history: `.alignment.md` (combined verdict and reports), `.checks.log`, `.ui-audit.md`, `.diff`, `.ui/` screenshots, `.app.log`. |
@@ -290,7 +290,7 @@ Every artifact below is local to your clone and hidden through `.git/info/exclud
 - **Playwright missing from `/mcp`:** restart clients, inspect `mcp get playwright`, and re-run full setup rather than `--project-only`. Existing entries are kept; repair stale custom entries yourself. Moving Node/global packages can invalidate absolute registration paths.
 - **Chromium cannot launch:** check current platform support and Linux system dependencies. Download success alone does not verify launchability.
 - **No browser tests ran:** MCP tools are used when requested. Add actual project specs and their command to gates/checks for repeatable assertions.
-- **Plan didn't reach Codex:** `handoff` posts to the newest interactive Codex session whose folder is this repo (sessions from the last 7 days). Keep one open there, pin one with `handoff.thread` in `.codex/verify.json` or `--thread <id>`, or use `--new-terminal`. Exit 5 means it printed the line to paste instead.
+- **Plan didn't reach Codex:** `handoff` posts to the newest interactive Codex session whose folder is this repo (sessions from the last 7 days). Keep one open there and send it one message first (an idle Codex has no session file yet), pin one with `handoff.thread` in `.codex/verify.json` or `--thread <id>`, or use `--new-terminal`. Exit 5 means it printed the line to paste instead.
 - **`wait` timed out:** Codex never ran `begin` (the message didn't arrive, or the session was busy). Check the Codex session, then ask Claude to wait again.
 - **UI audit BLOCKED:** nothing answered at the URL and the start command failed or timed out; see `.codex/verify/<task>/phase-<N>.app.log`. BLOCKED is reported but doesn't fail the phase.
 - **`stuck` run:** read the findings, resolve the code or plan decision, and let Claude send `handoff --continue`.

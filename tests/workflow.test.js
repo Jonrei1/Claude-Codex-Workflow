@@ -5,7 +5,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const skill = path.join(__dirname, "..", "skills", "claude-codex-workflow");
 const installer = path.join(skill, "scripts", "install.js");
@@ -265,23 +265,69 @@ test("handoff --print exits 5 with the paste line", () => {
   assert.match(result.stdout, /Execute \.codex\/plans\/add-badge\.md\. Follow \.codex\/workflow\/CODEX\.md, section Full plan execution\./);
 });
 
+// A codex shim that records its arguments in args.txt and exits with `code`.
+function fakeCodex(code = 0) {
+  const bin = tempDir("ccw-bin-");
+  const argsFile = path.join(bin, "args.txt");
+  if (isWindows) fs.writeFileSync(path.join(bin, "codex.cmd"), `@echo off\r\necho %* > "${argsFile}"\r\nexit /b ${code}\r\n`);
+  else {
+    fs.writeFileSync(path.join(bin, "codex"), `#!/bin/sh\necho "$@" > "${argsFile}"\nexit ${code}\n`);
+    fs.chmodSync(path.join(bin, "codex"), 0o755);
+  }
+  return { argsFile, env: { PATH: `${bin}${path.delimiter}${process.env.PATH}` } };
+}
+
 test("handoff posts the plan into the repo's open Codex session with codex queue", () => {
   const dir = workflowRepo();
   const home = tempDir("ccw-codex-home-");
   fakeSession(home, "11111111-2222-3333-4444-555555555555", dir);
-  const bin = tempDir("ccw-bin-");
-  const argsFile = path.join(bin, "args.txt");
-  if (isWindows) fs.writeFileSync(path.join(bin, "codex.cmd"), `@echo off\r\necho %* > "${argsFile}"\r\n`);
-  else {
-    fs.writeFileSync(path.join(bin, "codex"), `#!/bin/sh\necho "$@" > "${argsFile}"\n`);
-    fs.chmodSync(path.join(bin, "codex"), 0o755);
-  }
-  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md"], { CODEX_HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH}` });
+  const codex = fakeCodex();
+  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md"], { CODEX_HOME: home, ...codex.env });
   assert.strictEqual(result.status, 0, result.stdout + result.stderr);
-  const sent = fs.readFileSync(argsFile, "utf8");
+  const sent = fs.readFileSync(codex.argsFile, "utf8");
   assert.match(sent, /queue --thread 11111111-2222-3333-4444-555555555555 --message "?Execute \.codex\/plans\/add-badge\.md/);
   const handoff = JSON.parse(read(dir, ".codex/autopilot/handoff.json"));
   assert.strictEqual(handoff.via, "codex queue");
+});
+
+test("handoff with no Codex session prints the paste line instead of opening a terminal", () => {
+  const dir = workflowRepo();
+  const codex = fakeCodex();
+  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md", "--wait", "0"], { CODEX_HOME: tempDir("ccw-codex-home-"), ...codex.env });
+  assert.strictEqual(result.status, 5, result.stdout + result.stderr);
+  assert.match(result.stdout, /Paste this into Codex:\s+Execute \.codex\/plans\/add-badge\.md/);
+  assert.ok(!fs.existsSync(codex.argsFile), "codex should not be started");
+  assert.strictEqual(JSON.parse(read(dir, ".codex/autopilot/handoff.json")).via, "print");
+});
+
+test("handoff waits for the IDE's Codex session to appear, then queues into it", async () => {
+  const dir = workflowRepo();
+  const home = tempDir("ccw-codex-home-");
+  const codex = fakeCodex();
+  const child = spawn(process.execPath, [path.join(dir, ".codex", "autopilot.js"), "handoff", ".codex/plans/add-badge.md", "--wait", "30"], {
+    cwd: dir,
+    env: { ...process.env, CODEX_HOME: home, ...codex.env },
+  });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stdout += chunk));
+  setTimeout(() => fakeSession(home, "99999999-8888-7777-6666-555555555555", dir), 1000);
+  const status = await new Promise((resolve) => child.on("close", resolve));
+  assert.strictEqual(status, 0, stdout);
+  assert.match(stdout, /Send any message in your Codex terminal/);
+  assert.match(fs.readFileSync(codex.argsFile, "utf8"), /queue --thread 99999999-8888-7777-6666-555555555555/);
+  assert.strictEqual(JSON.parse(read(dir, ".codex/autopilot/handoff.json")).via, "codex queue");
+});
+
+test("handoff prints the paste line when codex queue fails", () => {
+  const dir = workflowRepo();
+  const home = tempDir("ccw-codex-home-");
+  fakeSession(home, "11111111-2222-3333-4444-555555555555", dir);
+  const result = autopilot(dir, ["handoff", ".codex/plans/add-badge.md"], { CODEX_HOME: home, ...fakeCodex(1).env });
+  assert.strictEqual(result.status, 5, result.stdout + result.stderr);
+  assert.match(result.stdout, /codex queue to 11111111-2222-3333-4444-555555555555 failed/);
+  assert.match(result.stdout, /Paste this into Codex:/);
+  assert.strictEqual(JSON.parse(read(dir, ".codex/autopilot/handoff.json")).via, "print");
 });
 
 test("wait returns when the run is done, with a summary, and 4 when it's stuck", () => {

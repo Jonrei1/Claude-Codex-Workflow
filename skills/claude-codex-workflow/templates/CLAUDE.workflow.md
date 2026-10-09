@@ -23,10 +23,13 @@ files and never add them to `.gitignore`: teammates must not see workflow change
        Codex can't see it.
     2. Run `node .codex/autopilot.js check .codex/plans/<slug>.md` and fix the plan until
        every checklist item passes.
-    3. Run `node .codex/autopilot.js handoff .codex/plans/<slug>.md`. It posts the plan into
-       the open Codex session for this repo (`codex queue`), or opens a new terminal running
-       Codex. Exit 5 means it couldn't reach Codex: show the printed line in its own code
-       block for the user to paste.
+    3. Tell the user in one line: "If your Codex terminal hasn't had a message yet, send it
+       any message now." Then run `node .codex/autopilot.js handoff .codex/plans/<slug>.md`
+       with a Bash `timeout` of at least 150000. It posts the plan into the open Codex session
+       for this repo (`codex queue`). Codex only records a session after its first message, so
+       if none is found yet it waits up to 90 s for one. Never open a new terminal yourself.
+       Exit 5 means it couldn't reach Codex: show the printed line in its own code block for
+       the user to paste.
     4. Start `node .codex/autopilot.js wait .codex/plans/<slug>.md` with Bash
        `run_in_background: true`, tell the user Codex is running and you're watching, and
        stop. Don't start Codex or `autopilot.js run` yourself.
