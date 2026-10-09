@@ -1,24 +1,39 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 "use strict";
 
-// Shared by claude-verify.js and autopilot.js.
+// Shared by claude-verify.js, autopilot.js and claude-plan-gate.js.
 //
-// Plans follow plans/_template.md: YAML-ish frontmatter, then `## Phase <N>: <title>`
-// sections with a **Gate** list of backticked commands.
+// Everything the workflow writes is local to this clone: plans in .codex/plans/, verify logs
+// in .codex/verify/<task>/, task summaries in .codex/tasks/. The installer hides them through
+// .git/info/exclude, so nothing shows up in `git status` for the user or their teammates.
+//
+// Plans follow .codex/plans/_template.md: YAML-ish frontmatter, `## Acceptance` items with
+// ids (A1, A2...), then `## Phase <N>: <title>` sections with Scope, Steps, Covers, Done when,
+// Hands off and a **Gate** list of backticked commands. planChecklist() checks all of it.
 //
 // Agents never commit, so progress is tracked with snapshots: the git tree of the whole
-// working tree (tracked and untracked, .gitignore respected), written through a
+// working tree (tracked and untracked, ignore rules respected), written through a
 // temporary index. A snapshot is a tree object, not a commit; it's on no branch and is
 // never pushed. Diffing two snapshots shows exactly what a phase changed.
 
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
+const { createRequire } = require("node:module");
 
-const git = process.platform === "win32" ? "git.exe" : "git";
+const isWindows = process.platform === "win32";
+const git = isWindows ? "git.exe" : "git";
+
+// Workflow locations, relative to the repo root.
+const plansRel = ".codex/plans";
+const tasksRel = ".codex/tasks";
+const verifyRel = ".codex/verify";
+const codexRulesRel = ".codex/workflow/CODEX.md";
+const planPattern = /^\.codex\/plans\/[^/]+\.md$/;
 
 // Changes under these paths are workflow state, not part of any phase.
-const workflowPaths = [":!plans", ":!.codex", ":!.claude", ":!.impeccable", ":!graphify-out"];
+const workflowPaths = [":!plans", ":!.codex", ":!.claude", ":!.agents/skills/caveman", ":!.impeccable", ":!graphify-out", ":!CLAUDE.local.md"];
 // Changes under these never trigger a verification run on their own.
 const triggerIgnored = [...workflowPaths, ":!*.md"];
 
@@ -44,7 +59,7 @@ function treeExists(repoRoot, tree) {
 // Tree of the current working tree, without touching the real index.
 function snapshot(repoRoot) {
   const realIndex = path.resolve(repoRoot, gitOut(repoRoot, ["rev-parse", "--git-path", "index"]));
-  const tempIndex = `${realIndex}.snapshot-${process.pid}`;
+  const tempIndex = `${realIndex}.snapshot-${process.pid}-${Date.now()}`;
   try {
     if (fs.existsSync(realIndex)) fs.copyFileSync(realIndex, tempIndex);
     const env = { ...process.env, GIT_INDEX_FILE: tempIndex };
@@ -70,6 +85,25 @@ function diffText(repoRoot, from, to, pathspec = workflowPaths) {
   return gitOut(repoRoot, ["diff", from, to, "--", ".", ...pathspec]);
 }
 
+// Per-task verify logs: .codex/verify/<slug>/. Reports without a task go to _untasked/.
+function taskVerifyDir(repoRoot, slug) {
+  return path.join(repoRoot, ".codex", "verify", slug || "_untasked");
+}
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function verifyConfig(repoRoot) {
+  return readJsonFile(path.join(repoRoot, ".codex", "verify.json")) || {};
+}
+
+// ---- Plans -------------------------------------------------------------------------------
+
 function frontmatter(text) {
   const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
   const fields = {};
@@ -85,9 +119,15 @@ function isPlaceholder(value) {
   return !value || /<[^>]*>/.test(value);
 }
 
-// Phases in document order: { id, title, body, gates: [command], commit }.
-// The first backticked span on each bullet under **Gate** is a command. `commit` is the
-// optional suggested commit message for the user.
+// The text after a bold label such as **Scope:** up to the next bold label, or null.
+function labelBlock(body, label) {
+  const match = new RegExp(`\\*\\*${label}[^*\\n]*\\*\\*([\\s\\S]*?)(?=\\n\\s*\\*\\*|$)`, "i").exec(body);
+  return match ? match[1].trim() : null;
+}
+
+// Phases in document order: { id, title, body, gates, commit, scope, steps, covers,
+// doneWhen, handsOff, uiAudit }. The first backticked span on each bullet under **Gate** is
+// a command. `commit` is the optional suggested commit message for the user.
 function parsePhases(text) {
   const headings = [...text.matchAll(/^## Phase ([\w.]+):\s*(.+)$/gm)];
   return headings.map((heading, i) => {
@@ -103,7 +143,20 @@ function parsePhases(text) {
       }
     }
     const commit = /\*\*(?:Suggested )?[Cc]ommit[^*]*:\*\*\s*`([^`]+)`/.exec(body);
-    return { id: heading[1], title: heading[2].trim(), body, gates, commit: commit ? commit[1].trim() : "" };
+    const covers = labelBlock(body, "Covers");
+    return {
+      id: heading[1],
+      title: heading[2].trim(),
+      body,
+      gates,
+      commit: commit ? commit[1].trim() : "",
+      scope: labelBlock(body, "Scope"),
+      steps: labelBlock(body, "Steps"),
+      covers: covers === null ? null : [...covers.matchAll(/\bA\d+\b/g)].map((m) => m[0]),
+      doneWhen: labelBlock(body, "Done when"),
+      handsOff: labelBlock(body, "Hands off"),
+      uiAudit: labelBlock(body, "UI audit"),
+    };
   });
 }
 
@@ -112,47 +165,172 @@ function nextH2(text, from) {
   return match ? from + match.index : text.length;
 }
 
-// Problems that stop autopilot before it starts: no phases, placeholders, missing gates.
-function planProblems(slug, meta, phases) {
-  const problems = [];
-  if (phases.length === 0) problems.push("no `## Phase <N>: <title>` sections");
-  for (const phase of phases) {
-    const label = `Phase ${phase.id}`;
-    if (isPlaceholder(phase.title)) problems.push(`${label}: title is a placeholder`);
-    if (phase.gates.length === 0) problems.push(`${label}: no gate command`);
-    for (const gate of phase.gates) {
-      if (isPlaceholder(gate)) problems.push(`${label}: gate \`${gate}\` is a placeholder`);
+function section(text, heading) {
+  const match = new RegExp(`^## ${heading}\\s*$`, "mi").exec(text);
+  if (!match) return null;
+  const start = match.index + match[0].length;
+  const next = /^## /m.exec(text.slice(start));
+  return text.slice(start, next ? start + next.index : text.length).trim();
+}
+
+// Acceptance items with ids: `- A1: ...`.
+function acceptanceIds(text) {
+  const body = section(text, "Acceptance") || "";
+  return [...body.matchAll(/^\s*[-*]\s*\**(A\d+)\**\s*[:.)-]/gm)].map((m) => m[1]);
+}
+
+// The plan's `## UI audit` section: start command, URL, viewports and checks.
+function uiAuditSpec(text) {
+  const body = section(text, "UI audit");
+  if (body === null) return null;
+  const value = (name) => {
+    const match = new RegExp(`^\\s*[-*]\\s*${name}:\\s*(.+)$`, "mi").exec(body);
+    return match ? match[1].replace(/`/g, "").trim() : "";
+  };
+  const checksAt = /^\s*[-*]\s*Checks:\s*$/im.exec(body);
+  const checks = checksAt
+    ? body.slice(checksAt.index + checksAt[0].length).split(/\r?\n/).map((line) => /^\s+[-*]\s*(.+)$/.exec(line)).filter(Boolean).map((m) => m[1].trim())
+    : [];
+  const viewports = value("Viewports").split(/[,\s]+/).map(Number).filter((n) => n > 0);
+  return { body, start: value("Start"), url: value("URL"), viewports, checks };
+}
+
+// Effective UI settings: the plan's ## UI audit section wins over .codex/verify.json "ui".
+function uiSettings(repoRoot, text) {
+  const config = verifyConfig(repoRoot).ui || {};
+  const spec = (text && uiAuditSpec(text)) || {};
+  return {
+    startCommand: (!isPlaceholder(spec.start) && spec.start) || config.startCommand || "",
+    url: (!isPlaceholder(spec.url) && spec.url) || config.url || "",
+    viewports: (spec.viewports && spec.viewports.length ? spec.viewports : config.viewports) || [375, 1280],
+    readyTimeoutSec: config.readyTimeoutSec || 90,
+    paths: Array.isArray(config.paths) ? config.paths : [],
+    checks: spec.checks || [],
+  };
+}
+
+const shellBuiltins = new Set(["cd", "echo", "test", "[", "true", "false", "exit", "set", "export", "env", "call", "if", "for"]);
+const packageManagerCommands = new Set(["exec", "dlx", "install", "i", "add", "remove", "why", "list", "ls", "create", "x"]);
+
+function onPath(command) {
+  if (/[\\/]/.test(command)) return fs.existsSync(command);
+  const exts = isWindows ? ["", ...(process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").toLowerCase().split(";")] : [""];
+  for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
+    for (const ext of exts) {
+      if (fs.existsSync(path.join(dir, command + ext))) return true;
     }
   }
-  if (meta.task && !isPlaceholder(meta.task) && meta.task !== slug) {
-    problems.push(`frontmatter task \`${meta.task}\` doesn't match the file name \`${slug}\``);
+  return false;
+}
+
+// Why a gate can't run here, or "" when it looks runnable. Checks each command in a chain:
+// package scripts must exist in package.json, other programs must be on PATH or in
+// node_modules/.bin.
+function gateProblem(repoRoot, gate) {
+  const pkg = readJsonFile(path.join(repoRoot, "package.json"));
+  const scripts = (pkg && pkg.scripts) || {};
+  const localBin = (name) => fs.existsSync(path.join(repoRoot, "node_modules", ".bin", name)) || (isWindows && fs.existsSync(path.join(repoRoot, "node_modules", ".bin", `${name}.cmd`)));
+  for (const part of gate.split(/&&|\|\||;|\|/)) {
+    const words = part.trim().split(/\s+/).filter((word) => !/^\w+=/.test(word));
+    if (!words.length) continue;
+    const [program, first, second] = words;
+    if (shellBuiltins.has(program)) continue;
+    let script = "";
+    if (["npm", "bun"].includes(program) && ["run", "run-script"].includes(first)) script = second;
+    else if (program === "npm" && ["test", "t"].includes(first)) script = "test";
+    else if (["pnpm", "yarn"].includes(program) && first === "run") script = second;
+    else if (["pnpm", "yarn"].includes(program) && first && !first.startsWith("-") && !packageManagerCommands.has(first)) {
+      if (!scripts[first] && !localBin(first)) return `\`${part.trim()}\`: no "${first}" script in package.json`;
+      continue;
+    }
+    if (script !== "") {
+      if (!script || !scripts[script]) return `\`${part.trim()}\`: no "${script || "?"}" script in package.json`;
+      continue;
+    }
+    if (!onPath(program) && !localBin(program) && !fs.existsSync(path.join(repoRoot, program))) {
+      return `\`${part.trim()}\`: \`${program}\` isn't on PATH`;
+    }
   }
-  return problems;
+  return "";
+}
+
+// The planning checklist: [{ ok, item, detail }]. A plan is handed off only when every
+// item is ok, so each phase ties into the next and the handoff carries everything Codex
+// and the reviewers need.
+function planChecklist(repoRoot, slug, text) {
+  const meta = frontmatter(text);
+  const phases = parsePhases(text);
+  const items = [];
+  const add = (ok, item, detail = "") => items.push({ ok, item, detail });
+
+  add(Boolean(meta.task) && !isPlaceholder(meta.task) && meta.task === slug, "frontmatter task matches the file name", meta.task === slug ? "" : `task: ${meta.task || "(missing)"}, file: ${slug}`);
+  add(["normal", "high"].includes(meta.risk), "frontmatter risk is normal or high", meta.risk || "(missing)");
+  add(["none", "codex"].includes(meta.review || "none"), "frontmatter review is none or codex", meta.review || "");
+  add(["yes", "no"].includes(meta.ui), "frontmatter ui is yes or no", meta.ui || "(missing)");
+  add(phases.length > 0, "has `## Phase <N>: <title>` sections");
+
+  const ids = acceptanceIds(text);
+  add(ids.length > 0, "acceptance items have ids (`- A1: ...`)");
+  const covered = new Set(phases.flatMap((phase) => phase.covers || []));
+  const uncovered = ids.filter((id) => !covered.has(id));
+  add(uncovered.length === 0, "every acceptance item is covered by a phase", uncovered.join(", "));
+  const unknown = [...covered].filter((id) => !ids.includes(id));
+  add(unknown.length === 0, "every **Covers:** id exists under Acceptance", unknown.join(", "));
+
+  phases.forEach((phase, index) => {
+    const label = `Phase ${phase.id}`;
+    const filled = (value) => value !== null && !isPlaceholder(value) && value.replace(/[.\s]/g, "") !== "";
+    add(!isPlaceholder(phase.title), `${label}: title`);
+    add(filled(phase.scope), `${label}: **Scope:**`);
+    add(filled(phase.steps), `${label}: **Steps:**`);
+    add(phase.covers !== null && phase.covers.length > 0, `${label}: **Covers:** acceptance ids`);
+    add(filled(phase.doneWhen), `${label}: **Done when:**`);
+    if (index < phases.length - 1) add(filled(phase.handsOff), `${label}: **Hands off:** (what phase ${phases[index + 1].id} relies on)`);
+    add(phase.gates.length > 0, `${label}: gate command`);
+    for (const gate of phase.gates) {
+      if (isPlaceholder(gate)) {
+        add(false, `${label}: gate is runnable`, `\`${gate}\` is a placeholder`);
+      } else {
+        const problem = gateProblem(repoRoot, gate);
+        add(!problem, `${label}: gate is runnable`, problem);
+      }
+    }
+  });
+
+  if (meta.ui === "yes") {
+    const spec = uiAuditSpec(text);
+    const ui = uiSettings(repoRoot, text);
+    add(spec !== null, "ui: yes has a `## UI audit` section");
+    add(Boolean(ui.url), "UI audit URL (plan `- URL:` or verify.json ui.url)");
+    add(Boolean(ui.startCommand), "UI audit start command (plan `- Start:` or verify.json ui.startCommand)");
+    add(Boolean(spec && spec.checks.length), "UI audit has `- Checks:` items");
+    add(phases.some((phase) => phase.uiAudit && !isPlaceholder(phase.uiAudit)), "at least one phase has a **UI audit:** block");
+  }
+  return items;
+}
+
+// Problems that stop autopilot before it starts.
+function planProblems(repoRoot, slug, text) {
+  return planChecklist(repoRoot, slug, text)
+    .filter((item) => !item.ok)
+    .map((item) => (item.detail ? `${item.item}: ${item.detail}` : item.item));
 }
 
 // ---- Headless Claude calls -------------------------------------------------------------
 //
-// Every headless call goes through runClaude, so all of them get the same trimmed setup and
-// the same usage record. Measured on a trivial prompt: listing only the built-in tools a call
-// needs (--tools) cuts its fixed input from about 37k to 14k tokens, and --strict-mcp-config
-// keeps MCP tool schemas out. Each call is appended to .codex/verify/usage.jsonl.
+// Every headless call goes through runClaude / runClaudeAsync, so all of them get the same
+// trimmed setup and the same usage record. Listing only the built-in tools a call needs
+// (--tools) cuts its fixed input from about 37k to 14k tokens, and --strict-mcp-config keeps
+// MCP tool schemas out unless the call passes its own --mcp-config (the UI audit's
+// Playwright server). Each call is appended to .codex/verify/usage.jsonl.
 //
 // Optional .codex/verify.json block:
 //   "headless": { "settingSources": "project,local" }
 // Passes --setting-sources, which skips user-level settings, plugins and hooks. It is opt-in:
 // user settings can carry authentication or proxy environment, which would stop applying.
 
-function readJsonFile(file) {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
 function headlessConfig(repoRoot) {
-  const config = readJsonFile(path.join(repoRoot, ".codex", "verify.json"));
-  return (config && config.headless) || {};
+  return verifyConfig(repoRoot).headless || {};
 }
 
 function usagePath(repoRoot) {
@@ -160,9 +338,9 @@ function usagePath(repoRoot) {
 }
 
 // `allowed` holds permission patterns such as `Bash(npm test:*)`; the built-in tool a call
-// needs is the name before the parenthesis.
+// needs is the name before the parenthesis. MCP tools come from --mcp-config instead.
 function builtinTools(allowed) {
-  return [...new Set(allowed.map((pattern) => pattern.replace(/\(.*$/, "")))];
+  return [...new Set(allowed.filter((pattern) => !pattern.startsWith("mcp__")).map((pattern) => pattern.replace(/\(.*$/, "")))];
 }
 
 function usageRecord(name, task, model, effort, parsed, ok) {
@@ -184,13 +362,13 @@ function usageRecord(name, task, model, effort, parsed, ok) {
   };
 }
 
-// On Windows an npm install puts only claude.cmd on PATH, and spawnSync can't start a .cmd
+// On Windows an npm install puts only claude.cmd on PATH, and spawn can't start a .cmd
 // without a shell (which would mangle the prompt). Find the executable the shim points to.
 let claudeCommand;
 function resolveClaude() {
   if (claudeCommand) return claudeCommand;
   claudeCommand = { command: "claude", prefix: [] };
-  if (process.platform !== "win32") return claudeCommand;
+  if (!isWindows) return claudeCommand;
   for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
     const exe = path.join(dir, "claude.exe");
     if (fs.existsSync(exe)) return (claudeCommand = { command: exe, prefix: [] });
@@ -205,9 +383,7 @@ function resolveClaude() {
   return claudeCommand;
 }
 
-// Runs `claude -p` and returns { status, error, text, stderr }. `text` is the model's final
-// reply, taken from the JSON result; if the output isn't JSON, it falls back to raw stdout.
-function runClaude(repoRoot, { name, task, prompt, model, effort, allowed, denied = [], permissionMode, env, timeout }) {
+function claudeArgs(repoRoot, { prompt, model, effort, allowed, denied = [], permissionMode, mcpConfig }) {
   const claude = resolveClaude();
   const args = [
     ...claude.prefix,
@@ -219,21 +395,17 @@ function runClaude(repoRoot, { name, task, prompt, model, effort, allowed, denie
     "--strict-mcp-config",
     "--tools", builtinTools(allowed).join(","),
   ];
+  if (mcpConfig) args.push("--mcp-config", mcpConfig);
   if (permissionMode) args.push("--permission-mode", permissionMode);
   const { settingSources } = headlessConfig(repoRoot);
   if (settingSources) args.push("--setting-sources", String(settingSources));
   // The variadic flags go last so they can't swallow another option.
   args.push("--allowedTools", ...allowed);
   if (denied.length) args.push("--disallowedTools", ...denied);
+  return { command: claude.command, args };
+}
 
-  const result = spawnSync(claude.command, args, {
-    cwd: repoRoot,
-    encoding: "utf8",
-    windowsHide: true,
-    maxBuffer: 256 * 1024 * 1024,
-    ...(env ? { env } : {}),
-    ...(timeout ? { timeout } : {}),
-  });
+function finishClaude(repoRoot, options, result) {
   const stdout = (result.stdout || "").trim();
   let parsed = null;
   try {
@@ -245,11 +417,89 @@ function runClaude(repoRoot, { name, task, prompt, model, effort, allowed, denie
   const ok = !result.error && result.status === 0 && !(parsed && parsed.is_error);
   try {
     fs.mkdirSync(path.dirname(usagePath(repoRoot)), { recursive: true });
-    fs.appendFileSync(usagePath(repoRoot), `${JSON.stringify(usageRecord(name, task, model, effort, parsed, ok))}\n`);
+    fs.appendFileSync(usagePath(repoRoot), `${JSON.stringify(usageRecord(options.name, options.task, options.model, options.effort, parsed, ok))}\n`);
   } catch {
     // Usage logging must never fail a run.
   }
   return { status: result.status, error: result.error, text, stderr: (result.stderr || "").trim() };
+}
+
+// Runs `claude -p` and returns { status, error, text, stderr }. `text` is the model's final
+// reply, taken from the JSON result; if the output isn't JSON, it falls back to raw stdout.
+function runClaude(repoRoot, options) {
+  const { command, args } = claudeArgs(repoRoot, options);
+  const result = spawnSync(command, args, {
+    cwd: repoRoot,
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: 256 * 1024 * 1024,
+    ...(options.env ? { env: options.env } : {}),
+    ...(options.timeout ? { timeout: options.timeout } : {}),
+  });
+  return finishClaude(repoRoot, options, result);
+}
+
+// The same call without blocking, so independent review steps can run side by side.
+function runClaudeAsync(repoRoot, options) {
+  const { command, args } = claudeArgs(repoRoot, options);
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(finishClaude(repoRoot, options, { stdout, stderr, ...result }));
+    };
+    let child;
+    try {
+      child = spawn(command, args, { cwd: repoRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], ...(options.env ? { env: options.env } : {}) });
+    } catch (error) {
+      done({ status: null, error });
+      return;
+    }
+    const timer = options.timeout
+      ? setTimeout(() => {
+          child.kill();
+          done({ status: null, error: Object.assign(new Error(`timed out after ${options.timeout} ms`), { code: "ETIMEDOUT" }) });
+        }, options.timeout)
+      : null;
+    child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+    child.on("error", (error) => done({ status: null, error }));
+    child.on("close", (status) => done({ status }));
+  });
+}
+
+// Runs a shell command without blocking: { cmd, ok, status, output }.
+function runShellAsync(repoRoot, cmd, { timeout, env } = {}) {
+  return new Promise((resolve) => {
+    let output = "";
+    let settled = false;
+    const child = spawn(cmd, { cwd: repoRoot, shell: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], ...(env ? { env } : {}) });
+    const finish = (ok, status) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ cmd, ok, status, output: output.trim() });
+    };
+    const timer = timeout ? setTimeout(() => { killTree(child.pid); finish(false, "timed out"); }, timeout) : null;
+    child.stdout.setEncoding("utf8").on("data", (chunk) => (output += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (output += chunk));
+    child.on("error", (error) => finish(false, error.message));
+    child.on("close", (code) => finish(code === 0, `exit ${code}`));
+  });
+}
+
+function killTree(pid) {
+  if (!pid) return;
+  try {
+    if (isWindows) spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore" });
+    else process.kill(-pid, "SIGTERM");
+  } catch {
+    try { process.kill(pid); } catch { /* already gone */ }
+  }
 }
 
 // Sums .codex/verify/usage.jsonl, optionally for one task, grouped by step name.
@@ -285,8 +535,130 @@ function usageSummary(repoRoot, task) {
   return out.join("\n");
 }
 
+// ---- Codex sessions ----------------------------------------------------------------------
+//
+// Codex records each session in $CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl (local date).
+// The first line is session_meta with the session id, cwd and source. The handoff posts
+// into the newest interactive session whose cwd is this repo, with `codex queue`.
+
+function codexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+}
+
+function samePath(a, b) {
+  const normal = (p) => path.resolve(p).replace(/[\\/]+$/, "");
+  return isWindows ? normal(a).toLowerCase() === normal(b).toLowerCase() : normal(a) === normal(b);
+}
+
+function firstLine(file, limit = 4 * 1024 * 1024) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const chunks = [];
+    const buffer = Buffer.alloc(64 * 1024);
+    let total = 0;
+    for (;;) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, total);
+      if (read <= 0) break;
+      const chunk = buffer.subarray(0, read);
+      const newline = chunk.indexOf(10);
+      chunks.push(Buffer.from(newline === -1 ? chunk : chunk.subarray(0, newline)));
+      total += read;
+      if (newline !== -1 || total >= limit) break;
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// The newest interactive Codex session for repoRoot: { id, source, file, mtime } or null.
+// Non-interactive `codex exec` sessions (source "exec") are skipped.
+function findCodexSession(repoRoot, { home = codexHome(), days = 7, now = Date.now() } = {}) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const files = [];
+  for (let d = 0; d < days; d++) {
+    const date = new Date(now - d * 24 * 60 * 60 * 1000);
+    const dir = path.join(home, "sessions", String(date.getFullYear()), pad(date.getMonth() + 1), pad(date.getDate()));
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!/^rollout-.*\.jsonl$/.test(name)) continue;
+      const file = path.join(dir, name);
+      try {
+        files.push({ file, mtime: fs.statSync(file).mtimeMs });
+      } catch {
+        // removed while scanning
+      }
+    }
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  for (const { file, mtime } of files) {
+    let meta;
+    try {
+      meta = JSON.parse(firstLine(file));
+    } catch {
+      continue;
+    }
+    const payload = meta && meta.type === "session_meta" ? meta.payload || {} : null;
+    if (!payload || !payload.cwd || payload.source === "exec" || /exec/.test(payload.originator || "")) continue;
+    if (samePath(payload.cwd, repoRoot)) return { id: payload.id || payload.session_id, source: payload.source || "", file, mtime };
+  }
+  return null;
+}
+
+// ---- Playwright --------------------------------------------------------------------------
+
+// Use the MCP package's Playwright dependency so the downloaded browser matches it.
+function resolvePlaywright(globalRoot) {
+  const packageFile = path.join(globalRoot, "@playwright", "mcp", "package.json");
+  const requireMcp = createRequire(packageFile);
+  const pkg = requireMcp(packageFile);
+  const playwright = requireMcp("playwright");
+  return {
+    version: pkg.version,
+    server: path.join(path.dirname(packageFile), pkg.bin["playwright-mcp"]),
+    cli: path.join(path.dirname(requireMcp.resolve("playwright/package.json")), "cli.js"),
+    browser: playwright.chromium.executablePath(),
+  };
+}
+
+// The Playwright MCP server config for a headless Claude call, or null when the global
+// @playwright/mcp package or its browser is missing.
+function playwrightMcpConfig(outputDir) {
+  const npm = spawnSync("npm root -g", { encoding: "utf8", windowsHide: true, shell: true, timeout: 60 * 1000 });
+  const root = (npm.stdout || "").trim();
+  if (npm.status !== 0 || !root) return null;
+  let installed;
+  try {
+    installed = resolvePlaywright(root);
+  } catch {
+    return null;
+  }
+  if (!fs.existsSync(installed.browser)) return null;
+  return {
+    mcpServers: {
+      playwright: {
+        command: process.execPath,
+        args: [installed.server, "--executable-path", installed.browser, "--headless", "--isolated", "--output-dir", outputDir],
+      },
+    },
+  };
+}
+
 module.exports = {
+  plansRel,
+  tasksRel,
+  verifyRel,
+  codexRulesRel,
+  planPattern,
   runClaude,
+  runClaudeAsync,
+  runShellAsync,
+  killTree,
   usageSummary,
   workflowPaths,
   triggerIgnored,
@@ -297,8 +669,20 @@ module.exports = {
   headTree,
   changedFiles,
   diffText,
+  taskVerifyDir,
+  readJsonFile,
+  verifyConfig,
   frontmatter,
   isPlaceholder,
   parsePhases,
+  acceptanceIds,
+  uiAuditSpec,
+  uiSettings,
+  gateProblem,
+  planChecklist,
   planProblems,
+  codexHome,
+  findCodexSession,
+  resolvePlaywright,
+  playwrightMcpConfig,
 };

@@ -2,37 +2,47 @@
 "use strict";
 
 // Codex Stop hook: when the working tree changed since the last verified snapshot, hand
-// verification to Claude Code in the background, in two steps:
+// verification to Claude Code in the background. Three steps run side by side, so a
+// phase's verification takes as long as the slowest step, not their sum:
 //
-//   Step A  checks + mechanical fixes. This script runs the project's checks itself; when
-//           all pass, no model is called. When one fails, Claude (Sonnet, low effort) gets
-//           the failing output and fixes only lint, formatting and type errors, then the
-//           checks run again. Report: .codex/verify/last.log
+//   Step A  checks + mechanical fixes. This script runs the project's checks itself
+//           (concurrently; build checks run last, on their own); when all pass, no model is
+//           called. When one fails, Claude (Sonnet, low effort) gets the failing output and
+//           fixes only lint, formatting and type errors, then the checks run again.
 //   Step B  alignment review, report-only (Sonnet, medium effort; Opus for risky work).
-//           Judges the change against its plan phase and ends with a VERDICT line.
-//           It has no write tools. Report: .codex/verify/alignment.md
+//           Judges the change against its plan phase. It has no write tools.
+//   Step C  UI audit, report-only, only for UI phases: a headless Claude run with the
+//           Playwright MCP server opens the app and checks the phase's **UI audit** items
+//           at each viewport. It starts the app when it isn't already running (after Step A's
+//           checks, so a build and a dev server don't fight over the same output).
+//
+// The verdict is PASS only when Step B says PASS, the checks pass after Step A, and the UI
+// audit isn't NEEDS REWORK. Reports are kept per task in .codex/verify/<task>/
+// (phase-<N>.checks.log, phase-<N>.alignment.md, phase-<N>.ui-audit.md, phase-<N>.ui/ for
+// screenshots); .codex/verify/last.log and alignment.md are copies of the latest run.
 //
 // Nobody but the user commits, so progress is tracked with snapshots (see workflow-lib.js).
 // The change under review is the diff from the last verified snapshot to the current
 // working tree, written to .codex/verify/phase.diff. The verified snapshot only moves
-// forward on VERDICT: PASS, so a phase that needs rework is reviewed again next time.
-// When the user commits, HEAD becomes the new starting point.
+// forward on PASS, so a phase that needs rework is reviewed again next time. When the user
+// commits, HEAD becomes the new starting point.
 //
-// The plan and phase come from .codex/verify/phase.json ({ "plan": "plans/x.md",
-// "phase": "2" }, written by Codex after a phase), else the newest plan in plans/.
+// The plan and phase come from .codex/verify/phase.json ({ "plan": ".codex/plans/x.md",
+// "phase": "2" }, written by Codex after a phase), else the newest plan in .codex/plans/.
 //
-// Checks come from .codex/verify.json ({ "checks": ["..."] }) when it exists,
-// otherwise they are detected from the repo root (Node, Rust, Go, Python). The same
-// file's optional "alignment" block sets the Step B model, effort, riskModel and
-// riskPaths. `node .codex/hooks/claude-verify.js --print-checks [--root <dir>]` prints
-// the resolved setup without starting a run. `--run [--base <tree>] [--plan <path>]
-// [--phase <id>]` verifies synchronously; .codex/autopilot.js uses it after each phase.
+// Checks come from .codex/verify.json ({ "checks": ["..."] }) when it exists, otherwise
+// they are detected from the repo root (Node, Rust, Go, Python). The same file's optional
+// "alignment" block sets the Step B model, effort, riskModel and riskPaths, "ui" sets the
+// UI audit, and "parallelChecks": false runs the checks one at a time.
+// `node .codex/hooks/claude-verify.js --print-checks [--root <dir>]` prints the resolved
+// setup without starting a run. `--run [--base <tree>] [--plan <path>] [--phase <id>]
+// [--gate <note>]` verifies synchronously; .codex/autopilot.js uses it after each phase.
 // Under autopilot (CODEX_AUTOPILOT=1, or .codex/autopilot/status.json says "running")
 // the Stop hook itself does nothing.
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawn, spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const lib = require("./workflow-lib");
 
 function flagValue(name) {
@@ -48,9 +58,11 @@ const logPath = path.join(stateDir, "last.log");
 const alignmentPath = path.join(stateDir, "alignment.md");
 const diffPath = path.join(stateDir, "phase.diff");
 const diffRel = ".codex/verify/phase.diff";
-const plansDir = path.join(repoRoot, "plans");
+const plansDir = path.join(repoRoot, ".codex", "plans");
 const isWindows = process.platform === "win32";
 const lockTimeoutMs = 45 * 60 * 1000;
+const checkTimeoutMs = 15 * 60 * 1000;
+const uiAuditTimeoutMs = 20 * 60 * 1000;
 const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 const alignmentDefaults = { model: "sonnet", effort: "medium", riskModel: "opus", riskPaths: [] };
@@ -144,7 +156,7 @@ function alignmentConfig() {
   return config;
 }
 
-// Minimal glob support for riskPaths: `**` (any depth), `*` and `?` (within a segment).
+// Minimal glob support for riskPaths and ui.paths: `**` (any depth), `*` and `?` (within a segment).
 function globToRegExp(glob) {
   let source = "";
   for (let i = 0; i < glob.length; i++) {
@@ -189,7 +201,7 @@ function writeState(state) {
 }
 
 // An unfinished autopilot run verifies each phase itself. A Codex-driven run
-// (`Execute plans/<task>.md`) that stopped as stuck or failed is resumed by rerunning
+// (`Execute .codex/plans/<task>.md`) that stopped as stuck or failed is resumed by rerunning
 // its step, so it stays quiet too.
 function autopilotActive() {
   try {
@@ -214,7 +226,8 @@ function newestPlan() {
 }
 
 function planInfo(rel, phase) {
-  return { rel, phase: phase || "infer", meta: lib.frontmatter(readText(rel)) };
+  const text = readText(rel);
+  return { rel, phase: phase || "infer", text, meta: lib.frontmatter(text) };
 }
 
 // The plan and phase under review: explicit flags, then Codex's phase marker, then the
@@ -224,7 +237,7 @@ function activePlan() {
   const marker = readJson(path.join(".codex", "verify", "phase.json"));
   if (marker && typeof marker.plan === "string" && exists(marker.plan)) return planInfo(marker.plan, String(marker.phase || ""));
   const file = newestPlan();
-  return file ? planInfo(`plans/${file}`, "") : null;
+  return file ? planInfo(`${lib.plansRel}/${file}`, "") : null;
 }
 
 // Where the change under review starts: --base, else the last verified snapshot while
@@ -259,14 +272,27 @@ function context() {
       }
     }
   }
-  return { head, state, base, current, files, hash: `${base.tree}:${current}`, plan, config, risk };
+  return { head, state, base, current, files, hash: `${base.tree}:${current}`, plan, config, risk, ui: uiNeeded(plan, files) };
+}
+
+// Step C runs when the phase has a **UI audit:** block, or the plan has `ui: yes` and the
+// change touches one of verify.json's ui.paths.
+function uiNeeded(plan, files) {
+  if (!plan || !plan.text) return null;
+  const ui = lib.uiSettings(repoRoot, plan.text);
+  const phase = lib.parsePhases(plan.text).find((candidate) => candidate.id === plan.phase);
+  const items = phase && phase.uiAudit && !lib.isPlaceholder(phase.uiAudit) ? phase.uiAudit : "";
+  const patterns = ui.paths.map(globToRegExp);
+  const touches = plan.meta.ui === "yes" && files.some((file) => patterns.some((re) => re.test(file)));
+  if (!items && !touches) return null;
+  return { ...ui, items, reason: items ? `phase ${phase.id} has a UI audit block` : "the change touches ui.paths" };
 }
 
 function writeDiff(base, current) {
   fs.writeFileSync(diffPath, lib.diffText(repoRoot, base, current) || "(no changes outside workflow paths)\n");
 }
 
-const diffNote = `The change is in ${diffRel}: a diff from the last verified snapshot to the current working tree, new files included and workflow paths (plans/, .codex/, .claude/, .impeccable/, graphify-out/) left out. Read all of it. Nothing is committed during the workflow, so don't look for commits.`;
+const diffNote = `The change is in ${diffRel}: a diff from the last verified snapshot to the current working tree, new files included and workflow paths (.codex/, .claude/, .impeccable/, graphify-out/, CLAUDE.local.md) left out. Read all of it. Nothing is committed during the workflow, so don't look for commits.`;
 
 function planLabel(ctx) {
   return ctx.plan ? `${ctx.plan.rel} (phase ${ctx.plan.phase})` : "(none)";
@@ -292,23 +318,28 @@ End with a short report: each command you re-ran and its result, the files you c
 the failures you left for rework.`;
 }
 
-const checkTimeoutMs = 15 * 60 * 1000;
+function tail(text, max) {
+  return text.length > max ? `...${text.slice(-max)}` : text;
+}
 
-function runChecks(checks) {
-  return checks.map((cmd) => {
-    const result = spawnSync(cmd, {
-      cwd: repoRoot,
-      shell: true,
-      encoding: "utf8",
-      windowsHide: true,
-      maxBuffer: 64 * 1024 * 1024,
-      timeout: checkTimeoutMs,
-    });
-    const ok = result.status === 0 && !result.error;
-    const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
-    const status = result.error ? (result.error.code === "ETIMEDOUT" ? "timed out" : result.error.message) : `exit ${result.status}`;
-    return { cmd, ok, status, tail: ok ? "" : tail(output, 2500) };
-  });
+// Concurrent by default; build checks run last, on their own, since they often share output
+// folders with other tools. "parallelChecks": false in verify.json runs them one at a time.
+async function runChecks(checks) {
+  const run = async (cmd) => {
+    const result = await lib.runShellAsync(repoRoot, cmd, { timeout: checkTimeoutMs });
+    return { cmd, ok: result.ok, status: result.status, tail: result.ok ? "" : tail(result.output, 2500) };
+  };
+  const parallel = lib.verifyConfig(repoRoot).parallelChecks !== false;
+  const byCmd = new Map();
+  if (!parallel) {
+    for (const cmd of checks) byCmd.set(cmd, await run(cmd));
+  } else {
+    const builds = checks.filter((cmd) => /\bbuild\b/.test(cmd));
+    const others = checks.filter((cmd) => !builds.includes(cmd));
+    for (const result of await Promise.all(others.map(run))) byCmd.set(result.cmd, result);
+    for (const cmd of builds) byCmd.set(cmd, await run(cmd));
+  }
+  return checks.map((cmd) => byCmd.get(cmd));
 }
 
 function checksReport(results, fixerReport) {
@@ -323,32 +354,6 @@ function addsLiveBlock(diff) {
   return diff.split("\n").some((line) => line.startsWith("+") && /impeccable-live-start|localhost[^\s"']*\/live\.js/.test(line));
 }
 
-function alignmentPrompt(ctx, checksReport) {
-  const plan = ctx.plan
-    ? `- Plan: ${ctx.plan.rel}\n- Current phase: ${ctx.plan.phase === "infer" ? "not named; infer it from the plan and the diff" : ctx.plan.phase}`
-    : "- Plan: none found in plans/. Review the change on its own and say so.";
-  return `You are reviewing a Codex implementation against its plan. Do NOT edit any file.
-
-Inputs:
-${plan}
-- Diff for this phase: ${diffNote}
-- Report from the checks step that just ran (it may have fixed lint or type errors):
-"""
-${checksReport || "(no report)"}
-"""
-
-For the current phase, report:
-1. DONE: acceptance items clearly satisfied, with file:line evidence.
-2. PARTIAL: items started but incomplete.
-3. MISSING: items in the plan with no evidence in the diff.
-4. OUT OF SCOPE: changed files or behavior the plan did not ask for.
-5. GATE: did the phase's test gate pass? Quote the command and result.
-6. RISKS: contract mismatches (API shape vs frontend types), migrations, auth changes.
-
-Judge from the diff and the files, not from Codex's own summary.
-End with exactly one line: VERDICT: PASS | NEEDS REWORK`;
-}
-
 function checksTools(checks) {
   const tools = ["Read", "Edit", "Write", "Grep", "Glob", "Bash(git diff:*)", "Bash(git status:*)"];
   for (const check of checks) {
@@ -358,22 +363,188 @@ function checksTools(checks) {
   return tools;
 }
 
+async function stepChecks(checks, task) {
+  let results = await runChecks(checks);
+  let fixerReport = "";
+  let fixerError = null;
+  if (results.some((r) => !r.ok)) {
+    const fix = await lib.runClaudeAsync(repoRoot, {
+      name: "checks-fix",
+      task,
+      prompt: fixPrompt(results.filter((r) => !r.ok)),
+      model: "sonnet",
+      effort: "low",
+      permissionMode: "acceptEdits",
+      allowed: checksTools(checks),
+    });
+    fixerError = fix.error || null;
+    fixerReport = fixerError ? `Failed to start claude: ${fixerError.message}` : tail(fix.text, 1500);
+    if (!fixerError) results = await runChecks(checks);
+  }
+  return { results, fixerReport, ok: results.every((r) => r.ok) };
+}
+
+function alignmentPrompt(ctx, gateNote) {
+  const plan = ctx.plan
+    ? `- Plan: ${ctx.plan.rel}\n- Current phase: ${ctx.plan.phase === "infer" ? "not named; infer it from the plan and the diff" : ctx.plan.phase}`
+    : "- Plan: none found in .codex/plans/. Review the change on its own and say so.";
+  return `You are reviewing a Codex implementation against its plan. Do NOT edit any file.
+
+Inputs:
+${plan}
+- Diff for this phase: ${diffNote}
+- Phase gate: ${gateNote || "not run by the verify script; report the gate command from the plan and whether the diff gives evidence it passes"}
+- The project's checks (typecheck, lint, build, tests) and, for UI phases, a browser audit run
+  in parallel with you and are reported separately. Don't run them.
+
+For the current phase, report:
+1. DONE: **Done when** and **Covers** items clearly satisfied, with file:line evidence.
+2. PARTIAL: items started but incomplete.
+3. MISSING: items in the plan with no evidence in the diff.
+4. OUT OF SCOPE: changed files or behavior the plan did not ask for.
+5. HANDS OFF: does the change provide what the phase's **Hands off** says the next phase relies on?
+6. GATE: the gate result above.
+7. RISKS: contract mismatches (API shape vs frontend types), migrations, auth changes.
+
+Judge from the diff and the files, not from Codex's own summary.
+End with exactly one line: VERDICT: PASS | NEEDS REWORK`;
+}
+
 // Step B reads only. Write tools are denied outright, not just left off the allow list.
 const alignmentTools = ["Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git status:*)", "Bash(git show:*)"];
 const alignmentDenied = ["Edit", "Write", "NotebookEdit", "PowerShell"];
 
-function tail(text, max) {
-  return text.length > max ? `...${text.slice(-max)}` : text;
+async function stepAlignment(ctx, model, task, gateNote) {
+  const result = await lib.runClaudeAsync(repoRoot, {
+    name: "alignment",
+    task,
+    prompt: alignmentPrompt(ctx, gateNote),
+    model,
+    effort: ctx.config.effort,
+    allowed: alignmentTools,
+    denied: alignmentDenied,
+  });
+  const report = result.text || (result.error ? `Failed to start claude: ${result.error.message}` : result.stderr);
+  const verdicts = [...report.matchAll(/^[\s*_`>]*VERDICT:\s*(PASS|NEEDS REWORK)/gim)];
+  return { started: !result.error, verdict: verdicts.length ? verdicts[verdicts.length - 1][1].toUpperCase() : "", report };
 }
 
-function runVerification() {
+// ---- Step C: UI audit ----
+
+const uiTools = [
+  "Read",
+  "Grep",
+  "Glob",
+  ...["navigate", "navigate_back", "snapshot", "take_screenshot", "resize", "click", "type", "hover", "press_key", "select_option", "console_messages", "network_requests", "wait_for", "close"].map(
+    (tool) => `mcp__playwright__browser_${tool}`,
+  ),
+];
+const uiDenied = ["Edit", "Write", "NotebookEdit", "Bash", "PowerShell", "mcp__playwright__browser_evaluate", "mcp__playwright__browser_run_code"];
+
+async function responds(url) {
+  try {
+    await fetch(url, { signal: AbortSignal.timeout(3000), redirect: "manual" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Reuses an app already answering on the URL; otherwise starts it and waits until it answers.
+async function ensureApp(ui, logFile) {
+  if (await responds(ui.url)) return { ok: true, note: `app already running at ${ui.url}` };
+  if (!ui.startCommand) return { ok: false, note: `nothing answers at ${ui.url} and no start command is set (plan "- Start:" or verify.json ui.startCommand)` };
+  const out = fs.openSync(logFile, "w");
+  const child = spawn(ui.startCommand, { cwd: repoRoot, shell: true, windowsHide: true, detached: !isWindows, stdio: ["ignore", out, out] });
+  const deadline = Date.now() + ui.readyTimeoutSec * 1000;
+  let exited = false;
+  child.on("exit", () => (exited = true));
+  while (Date.now() < deadline && !exited) {
+    if (await responds(ui.url)) return { ok: true, child, note: `started \`${ui.startCommand}\`` };
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  lib.killTree(child.pid);
+  return { ok: false, note: `\`${ui.startCommand}\` ${exited ? "exited" : `didn't answer at ${ui.url} within ${ui.readyTimeoutSec}s`}; see ${path.relative(repoRoot, logFile)}` };
+}
+
+function uiPrompt(ctx, ui, outDir) {
+  const design = exists("DESIGN.md") ? "\n- Follow DESIGN.md (read it first) for the expected visual system." : "";
+  return `You are auditing the UI of a Codex implementation in a real browser, using the Playwright tools. Do NOT edit any file.
+
+- Plan: ${ctx.plan.rel}, phase ${ctx.plan.phase}
+- App URL: ${ui.url}
+- Viewports (width in px): ${ui.viewports.join(", ")}
+- What this phase must show:
+${ui.items || "(no phase-specific items)"}
+- Plan-wide UI checks:
+${ui.checks.length ? ui.checks.map((check) => `  - ${check}`).join("\n") : "  (none)"}${design}
+
+For each viewport: resize, navigate, take a snapshot, and do the interactions the items need.
+Take a screenshot of each state you judge (they are saved in ${path.relative(repoRoot, outDir)}).
+Check the items above, plus: layout breaks, overflow and clipped text, overlapping elements,
+console errors, failed network requests, missing focus states and unlabeled controls.
+
+Report each item as PASS or FAIL with what you saw, then any other problems found.
+If the page can't be loaded at all, say so and use BLOCKED.
+End with exactly one line: UI AUDIT: PASS | NEEDS REWORK | BLOCKED`;
+}
+
+async function stepUiAudit(ctx, task, taskDir, tag, checksDone) {
+  const ui = ctx.ui;
+  if (!ui) return { status: "not run", report: "" };
+  if (!ui.url) return { status: "BLOCKED", report: "No UI audit URL: set `- URL:` in the plan's ## UI audit section or ui.url in .codex/verify.json." };
+  const outDir = path.join(taskDir, `${tag}.ui`);
+  fs.mkdirSync(outDir, { recursive: true });
+  const mcp = lib.playwrightMcpConfig(outDir);
+  if (!mcp) return { status: "BLOCKED", report: "Playwright MCP or its Chromium isn't installed globally; re-run the workflow setup." };
+  const mcpFile = path.join(taskDir, `${tag}.playwright.mcp.json`);
+  fs.writeFileSync(mcpFile, JSON.stringify(mcp, null, 2));
+
+  // A dev server and a build share output folders, so wait for Step A before starting the app
+  // (unless ui.parallelWithChecks is set). An app that is already running is used right away.
+  if (!(await responds(ui.url)) && lib.verifyConfig(repoRoot).ui?.parallelWithChecks !== true) await checksDone;
+  const app = await ensureApp(ui, path.join(taskDir, `${tag}.app.log`));
+  if (!app.ok) return { status: "BLOCKED", report: app.note };
+  try {
+    const config = lib.verifyConfig(repoRoot).ui || {};
+    const result = await lib.runClaudeAsync(repoRoot, {
+      name: "ui-audit",
+      task,
+      prompt: uiPrompt(ctx, ui, outDir),
+      model: config.model || "sonnet",
+      effort: config.effort || "medium",
+      allowed: uiTools,
+      denied: uiDenied,
+      mcpConfig: mcpFile,
+      timeout: uiAuditTimeoutMs,
+    });
+    const report = result.text || (result.error ? `Failed to start claude: ${result.error.message}` : result.stderr);
+    const verdicts = [...report.matchAll(/^[\s*_`>]*UI AUDIT:\s*(PASS|NEEDS REWORK|BLOCKED)/gim)];
+    const status = verdicts.length ? verdicts[verdicts.length - 1][1].toUpperCase() : result.error ? "BLOCKED" : "NEEDS REWORK";
+    return { status, report: `${app.note}\n\n${report}` };
+  } finally {
+    if (app.child) lib.killTree(app.child.pid);
+  }
+}
+
+function runTag(ctx) {
+  const phase = ctx.plan && ctx.plan.phase && ctx.plan.phase !== "infer" ? ctx.plan.phase : "";
+  return phase ? `phase-${phase}` : `run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+}
+
+async function runVerification() {
   fs.mkdirSync(stateDir, { recursive: true });
   const checks = detectChecks();
   const ctx = context();
+  const task = ctx.plan ? path.basename(ctx.plan.rel, ".md") : "";
+  const taskDir = lib.taskVerifyDir(repoRoot, task);
+  fs.mkdirSync(taskDir, { recursive: true });
+  const tag = runTag(ctx);
   const model = ctx.risk ? ctx.config.riskModel : ctx.config.model;
   const modelLine = `${model} / effort ${ctx.config.effort}${ctx.risk ? ` (risk: ${ctx.risk})` : ""}`;
   const range = `${ctx.base.tree.slice(0, 7)} (${ctx.base.from}) -> working tree`;
   writeDiff(ctx.base.tree, ctx.current);
+  fs.copyFileSync(diffPath, path.join(taskDir, `${tag}.diff`));
 
   fs.writeFileSync(
     logPath,
@@ -382,90 +553,80 @@ function runVerification() {
       `Range: ${range} | Plan: ${planLabel(ctx)}`,
       `Step A checks: ${checks.length ? checks.join(" | ") : "(none configured)"}`,
       `Step B alignment: ${modelLine}`,
+      `Step C UI audit: ${ctx.ui ? `${ctx.ui.url || "(no URL)"} at ${ctx.ui.viewports.join(", ")} (${ctx.ui.reason})` : "not needed for this phase"}`,
+      "Steps A, B and C run in parallel.",
       "",
       "",
     ].join("\n"),
   );
 
-  const task = ctx.plan ? path.basename(ctx.plan.rel, ".md") : "";
   const liveBlock = addsLiveBlock(lib.diffText(repoRoot, ctx.base.tree, ctx.current));
+  const checksPromise = stepChecks(checks, task);
+  const [checksResult, alignment, uiAudit] = await Promise.all([
+    checksPromise,
+    stepAlignment(ctx, model, task, flagValue("--gate")),
+    stepUiAudit(ctx, task, taskDir, tag, checksPromise),
+  ]);
 
-  // Step A: run the checks in Node. Claude is called only to fix a failure.
-  let results = runChecks(checks);
-  let fixerReport = "";
-  let fixerError = null;
-  if (results.some((r) => !r.ok)) {
-    const failures = results.filter((r) => !r.ok);
-    const fix = lib.runClaude(repoRoot, {
-      name: "checks-fix",
-      task,
-      prompt: fixPrompt(failures),
-      model: "sonnet",
-      effort: "low",
-      permissionMode: "acceptEdits",
-      allowed: checksTools(checks),
-    });
-    fixerError = fix.error || null;
-    fixerReport = fixerError ? `Failed to start claude: ${fixerError.message}` : tail(fix.text, 1500);
-    if (!fixerError) results = runChecks(checks);
-  }
-  const checksText = [liveBlock ? "MUST REMOVE BEFORE COMMIT: the change adds an Impeccable live-mode block.\n" : "", checksReport(results, fixerReport)].join("");
+  const checksText = [liveBlock ? "MUST REMOVE BEFORE COMMIT: the change adds an Impeccable live-mode block.\n" : "", checksReport(checksResult.results, checksResult.fixerReport)].join("");
   fs.appendFileSync(logPath, `${checksText}\n`);
-  const checksStatus = checks.length === 0 ? "none" : results.every((r) => r.ok) ? "pass" : "fail";
+  const checksStatus = checks.length === 0 ? "none" : checksResult.ok ? "pass" : "fail";
 
-  // Step B reviews the tree as Step A left it.
   const reviewed = lib.snapshot(repoRoot);
-  writeDiff(ctx.base.tree, reviewed);
+  const passed = alignment.verdict === "PASS" && checksResult.ok && uiAudit.status !== "NEEDS REWORK";
+  const verdict = !alignment.started ? "NOT RUN" : passed ? "PASS" : "NEEDS REWORK";
+  const reasons = [
+    alignment.verdict !== "PASS" ? `alignment ${alignment.verdict || "gave no verdict"}` : "",
+    checksResult.ok ? "" : "checks still fail after the fix step",
+    uiAudit.status === "NEEDS REWORK" ? "UI audit NEEDS REWORK" : "",
+  ].filter(Boolean);
 
-  let verdict = "";
-  let reviewStarted = false;
-  if (!fixerError) {
-    const stepB = lib.runClaude(repoRoot, {
-      name: "alignment",
-      task,
-      prompt: alignmentPrompt(ctx, tail(checksText, 3000)),
-      model,
-      effort: ctx.config.effort,
-      allowed: alignmentTools,
-      denied: alignmentDenied,
-    });
-    reviewStarted = !stepB.error;
-    const report = stepB.text || (stepB.error ? `Failed to start claude: ${stepB.error.message}` : stepB.stderr);
-    const verdicts = [...report.matchAll(/^[\s*_`>]*VERDICT:\s*(PASS|NEEDS REWORK)/gim)];
-    verdict = verdicts.length ? verdicts[verdicts.length - 1][1].toUpperCase() : "";
-    const header = [
-      "# Alignment review",
-      "",
-      `- Run: ${new Date().toISOString()}`,
-      `- Model: ${modelLine}`,
-      `- Plan: ${planLabel(ctx)}`,
-      `- Range: ${ctx.base.tree} (${ctx.base.from}) -> ${reviewed} (working tree)`,
-      `- Verdict: ${verdict || (reviewStarted ? "none (treated as NEEDS REWORK)" : "none (claude did not start)")}`,
-      "",
-      "---",
-      "",
-    ].join("\n");
-    fs.writeFileSync(alignmentPath, `${header}${report}\n`);
-  }
+  const header = [
+    "# Verification",
+    "",
+    `- Run: ${new Date().toISOString()}`,
+    `- Plan: ${planLabel(ctx)}`,
+    `- Range: ${ctx.base.tree} (${ctx.base.from}) -> ${reviewed} (working tree)`,
+    `- Verdict: ${verdict}${reasons.length && verdict !== "NOT RUN" ? ` (${reasons.join("; ")})` : ""}`,
+    `- Alignment (${modelLine}): ${alignment.verdict || (alignment.started ? "none (treated as NEEDS REWORK)" : "claude did not start")}`,
+    `- Checks: ${checksStatus}`,
+    `- UI audit: ${uiAudit.status}`,
+    "",
+    "---",
+    "",
+    "## Alignment",
+    "",
+    alignment.report,
+    ...(checksResult.ok ? [] : ["", "## Checks that still fail", "", checksText]),
+    ...(uiAudit.report ? ["", "## UI audit", "", uiAudit.report] : []),
+    "",
+  ].join("\n");
+  fs.writeFileSync(alignmentPath, header);
+  fs.copyFileSync(alignmentPath, path.join(taskDir, `${tag}.alignment.md`));
+  if (uiAudit.report) fs.writeFileSync(path.join(taskDir, `${tag}.ui-audit.md`), `# UI audit: ${uiAudit.status}\n\n${uiAudit.report}\n`);
 
   // Advance the verified snapshot only on PASS; otherwise keep this run's base, so the same
   // phase is reviewed again. Record the post-run state either way, so Claude's own fixes
   // don't trigger another run on the next Stop.
-  const passed = verdict === "PASS";
   const nextBase = passed ? reviewed : ctx.base.tree;
   writeState({
     verifiedTree: nextBase,
     verifiedHead: ctx.head,
     fingerprint: `${nextBase}:${reviewed}`,
-    lastVerdict: verdict || (reviewStarted ? "NEEDS REWORK" : "NOT RUN"),
+    lastVerdict: verdict,
+    lastAlignment: alignment.verdict || "none",
+    lastChecks: checksStatus,
+    lastUiAudit: uiAudit.status,
     lastPlan: planLabel(ctx),
+    lastTask: task,
+    lastReports: path.relative(repoRoot, taskDir).split(path.sep).join("/"),
     reported: false,
   });
   fs.appendFileSync(
     logPath,
-    `\nFinished ${new Date().toISOString()} | Checks: ${checksStatus} | Alignment verdict: ${verdict || "none"}, see ${path.relative(repoRoot, alignmentPath)}\n`,
+    `\nFinished ${new Date().toISOString()} | Checks: ${checksStatus} | Alignment: ${alignment.verdict || "none"} | UI audit: ${uiAudit.status} | Verdict: ${verdict}, see ${path.relative(repoRoot, alignmentPath)}\n`,
   );
-  fs.rmSync(lockPath, { force: true });
+  fs.copyFileSync(logPath, path.join(taskDir, `${tag}.checks.log`));
 }
 
 if (process.argv.includes("--print-checks")) {
@@ -477,9 +638,18 @@ if (process.argv.includes("--print-checks")) {
   console.log(`Range: ${ctx.base.tree.slice(0, 7)} (${ctx.base.from}) -> working tree, ${ctx.files.length} changed file(s)`);
   console.log(`Plan: ${planLabel(ctx)}`);
   console.log(`Risk: ${ctx.risk || "normal"} -> Step B uses ${ctx.risk ? riskModel : model}`);
+  const ui = lib.uiSettings(repoRoot, "");
+  console.log(`UI audit: ${ui.url ? `${ui.url}, start \`${ui.startCommand || "(already running)"}\`, viewports ${ui.viewports.join(", ")}` : "no ui.url in .codex/verify.json (a plan's ## UI audit section can set it)"}`);
 } else if (process.argv.includes("--run")) {
-  runVerification();
-  emitHookResult();
+  runVerification()
+    .catch((error) => {
+      fs.appendFileSync(logPath, `\nVerification crashed: ${error.stack || error}\n`);
+      writeState({ ...readState(), lastVerdict: "NOT RUN", reported: false });
+    })
+    .finally(() => {
+      fs.rmSync(lockPath, { force: true });
+      emitHookResult();
+    });
 } else if (process.env.CODEX_AUTOPILOT === "1" || autopilotActive()) {
   // Autopilot runs verification itself after each phase; don't start an overlapping run.
   emitHookResult();
