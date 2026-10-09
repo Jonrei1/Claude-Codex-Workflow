@@ -17,28 +17,54 @@ This is the default handoff: Claude posts one line into this session, and you ru
 plan here. `.codex/autopilot.js` does the snapshots, gates, Claude verification and the task
 summary; you do the implementation and the fixes.
 
-1. `node .codex/autopilot.js check .codex/plans/<task>.md`. If it isn't runnable, stop and
-   report the problems. Then `node .codex/autopilot.js begin .codex/plans/<task>.md`.
-2. If `begin` says plan review is on, do the "Plan review" below (append
-   `## Codex Findings` only), then run `node .codex/autopilot.js triage .codex/plans/<task>.md`
-   and re-read the plan: Claude may have added phases or changed gates.
-3. For each phase, in document order (including phases like "Phase 2.5"):
-   1. `node .codex/autopilot.js phase .codex/plans/<task>.md <N>`
-   2. Implement the phase following "Phase execution" below.
+Every step has a "done when" and an "if it fails". Never end your turn in the middle of a run
+without either `close` (done) or `stop` (blocked): Claude is waiting on one of them.
+To stop, run `node .codex/autopilot.js stop .codex/plans/<task>.md --reason "<what blocks it>"`.
+
+1. **Check:** `node .codex/autopilot.js check .codex/plans/<task>.md`.
+   - Done when: it prints `Runnable.` (exit 0).
+   - If it fails: the run hasn't begun, so just stop and report the problems it lists.
+2. **Begin:** `node .codex/autopilot.js begin .codex/plans/<task>.md`.
+   - It also records the baseline: every gate and project check is run once on the untouched
+     tree. Errors already there before the task won't block later gates or checks. This can
+     take a minute.
+   - Done when: it prints `Phases, in order: ...` and the next command.
+   - If it fails: report the error and stop.
+3. **Plan review** (only if `begin` says plan review is on): do the "Plan review" below
+   (append `## Codex Findings` only), then `node .codex/autopilot.js triage .codex/plans/<task>.md`.
+   - Done when: `triage` prints the phases. Re-read the plan, because Claude may have added
+     phases or changed gates.
+   - If it fails: `stop` with the error.
+4. **For each phase**, in document order (including phases like "Phase 2.5"):
+   1. `node .codex/autopilot.js phase .codex/plans/<task>.md <N>`. Done when it prints
+      "Implement phase <N>".
+   2. Implement the phase following "Phase execution" below. Done when its **Done when** items
+      hold and its **Hands off** exists. If it can't be done within the phase's scope (it
+      needs files outside it, a dependency install, a decision, credentials), `stop` with the
+      reason. Don't change out-of-scope files to get past it.
    3. `node .codex/autopilot.js verify .codex/plans/<task>.md <N>`, then act on its exit code:
-      - **0 (PASS):** go to the next phase.
-      - **2 (gate failed):** fix the failure within the phase, then run verify again.
+      - **0 (PASS):** done. Go to the next phase.
+      - **2 (gate failed):** the output lists what is new since the task started. Fix those
+        within the phase, then run verify again. Errors that were already in the repo don't
+        block the gate, so never "fix" unrelated files for it. If the new failure can't be
+        fixed within the phase, `stop` with the reason. After 3 gate failures in a row the
+        run stops itself.
       - **3 (NEEDS REWORK):** the output includes `.codex/verify/alignment.md`. Fix every
         MISSING and PARTIAL item, every check that still fails and every UI audit FAIL, and
         undo every OUT OF SCOPE change, within the phase. If a finding is about code the
         phase didn't touch, leave it and say so. Then run verify again.
-      - **1 or 4 (failed or stuck):** stop and report the reason the command printed.
-4. `node .codex/autopilot.js close .codex/plans/<task>.md`. It runs `graphify update .` and has
-   Claude write `.codex/tasks/<date>-<task>.md`.
-5. End your reply with: `Task <task> done. Claude is reviewing it.`
+      - **1 or 4 (failed or stuck):** the run is already marked stopped. Report the reason the
+        command printed and end your turn.
+5. **Close:** `node .codex/autopilot.js close .codex/plans/<task>.md`. It runs `graphify update .`
+   and has Claude write `.codex/tasks/<date>-<task>.md`.
+   - Done when: it prints `Task <task> done.`
+   - If it fails: it marks the run failed itself. Report the reason.
+6. End your reply with: `Task <task> done. Claude is reviewing it.`
 
 Rules for this mode:
-- Don't stop between phases to ask; keep going until `close`, a failure or a stuck run.
+- Don't stop between phases to ask. Keep going until `close`, a failure, a stuck run or `stop`.
+- If anything else blocks you (a command you can't run, a missing tool, a sandbox refusal you
+  can't get approved), `stop` with the reason before ending your turn.
 - `verify`, `triage` and `close` start headless Claude runs: they need network access
   and take several minutes. Run them with a long timeout (30 minutes) and request
   permission to run outside the sandbox if the sandbox blocks them.
@@ -55,8 +81,10 @@ Rules for this mode:
 - Do exactly one phase per turn. Stop after it. Do not start the next phase.
 - Before editing, read only the files the phase lists. Use graphify for anything else.
 - Deliver what the phase's **Hands off** promises; the next phase is written against it.
-- Run the phase gate. If it fails, fix it within the phase. If you cannot, stop and say why.
-- Do not change files outside the phase scope. If you need to, stop and report it.
+- Run the phase gate. If it fails, fix it within the phase. If you cannot, stop and say why
+  (in a full plan execution, with `node .codex/autopilot.js stop ... --reason "<why>"`).
+- Do not change files outside the phase scope. If you need to, stop and report it (same `stop`
+  command in a full plan execution).
 - **Single-phase mode** (asked "Execute phase <N> of .codex/plans/<task>.md"): the steps
   below this one apply only here, not in a full plan execution.
 - When the phase is done, write `.codex/verify/phase.json` with

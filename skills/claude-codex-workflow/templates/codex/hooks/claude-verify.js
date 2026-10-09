@@ -92,61 +92,8 @@ function readJson(name) {
   }
 }
 
-function nodeChecks() {
-  const pkg = readJson("package.json");
-  if (!pkg) return [];
-  const scripts = pkg.scripts || {};
-  const pm = exists("pnpm-lock.yaml")
-    ? "pnpm"
-    : exists("yarn.lock")
-      ? "yarn"
-      : exists("bun.lock") || exists("bun.lockb")
-        ? "bun"
-        : "npm";
-  const run = { npm: "npm run", pnpm: "pnpm", yarn: "yarn", bun: "bun run" }[pm];
-  const exec = { npm: "npx", pnpm: "pnpm exec", yarn: "yarn", bun: "bunx" }[pm];
-
-  const checks = [];
-  if (scripts.typecheck) checks.push(`${run} typecheck`);
-  else if (exists("tsconfig.json")) checks.push(`${exec} tsc --noEmit`);
-  if (scripts.lint) checks.push(`${run} lint`);
-  if (scripts.build) checks.push(`${run} build`);
-  const test = scripts.test || "";
-  if (test && !test.includes("no test specified") && !test.includes("watch")) {
-    checks.push(`${run} test`);
-  }
-  return checks;
-}
-
-function pythonChecks() {
-  const hasPython =
-    exists("pyproject.toml") ||
-    exists("setup.cfg") ||
-    fs.readdirSync(repoRoot).some((file) => /^requirements.*\.txt$/.test(file));
-  if (!hasPython) return [];
-  const pyproject = readText("pyproject.toml");
-  const checks = [];
-  if (pyproject.includes("[tool.ruff") || exists("ruff.toml") || exists(".ruff.toml")) {
-    checks.push("ruff check .");
-  }
-  if (pyproject.includes("[tool.mypy") || exists("mypy.ini")) checks.push("mypy .");
-  if (pyproject.includes("[tool.pytest") || exists("pytest.ini") || exists("tests")) {
-    checks.push("pytest -q");
-  }
-  return checks;
-}
-
 function detectChecks() {
-  const override = readJson(path.join(".codex", "verify.json"));
-  if (override && Array.isArray(override.checks)) {
-    return override.checks.filter((check) => typeof check === "string" && check.trim());
-  }
-  return [
-    ...nodeChecks(),
-    ...(exists("Cargo.toml") ? ["cargo check", "cargo test"] : []),
-    ...(exists("go.mod") ? ["go vet ./...", "go build ./...", "go test ./..."] : []),
-    ...pythonChecks(),
-  ];
+  return lib.detectChecks(repoRoot);
 }
 
 function alignmentConfig() {
@@ -300,8 +247,18 @@ function planLabel(ctx) {
 
 // Step A runs the checks itself, in Node, and only calls Claude when one fails: a passing
 // run costs no model tokens. Claude then gets just the failing commands and their output.
+// During an autopilot run, a check whose failures were all there before the task started
+// (the run's baseline) counts as passing and isn't sent to Claude.
 function fixPrompt(failures) {
-  const failed = failures.map((f) => `### \`${f.cmd}\` (${f.status})\n${f.tail || "(no output)"}`).join("\n\n");
+  const failed = failures
+    .map((f) => {
+      const fresh = f.newLines && f.newLines.length ? `New since the task started (fix these):\n${f.newLines.slice(0, 80).join("\n")}\n\nFull output:\n` : "";
+      return `### \`${f.cmd}\` (${f.status})\n${fresh}${f.tail || "(no output)"}`;
+    })
+    .join("\n\n");
+  const baselineNote = failures.some((f) => f.newLines && f.newLines.length)
+    ? "\n   Errors not listed under \"New since the task started\" were already in the repo before the task\n   began. Leave them and their files alone."
+    : "";
   return `Codex just finished a turn in this repo and these project checks failed:
 
 ${failed}
@@ -311,7 +268,7 @@ ${failed}
    pass or only other failures remain. If a test, build or behavior fails for any other reason,
    do not fix it: report the command and the error. Don't revert Codex's work to make checks pass.
    If a check fails under Bash with a process-start error (such as 0xc0000142 on Windows),
-   re-run that check with the PowerShell tool before treating it as a real failure.
+   re-run that check with the PowerShell tool before treating it as a real failure.${baselineNote}
 3. Don't judge whether the change matches its plan. A separate review step does that.
 4. Never run git commit, git add or git push. The user commits by hand.
 End with a short report: each command you re-ran and its result, the files you changed, and
@@ -322,29 +279,28 @@ function tail(text, max) {
   return text.length > max ? `...${text.slice(-max)}` : text;
 }
 
-// Concurrent by default; build checks run last, on their own, since they often share output
-// folders with other tools. "parallelChecks": false in verify.json runs them one at a time.
-async function runChecks(checks) {
-  const run = async (cmd) => {
-    const result = await lib.runShellAsync(repoRoot, cmd, { timeout: checkTimeoutMs });
-    return { cmd, ok: result.ok, status: result.status, tail: result.ok ? "" : tail(result.output, 2500) };
-  };
-  const parallel = lib.verifyConfig(repoRoot).parallelChecks !== false;
-  const byCmd = new Map();
-  if (!parallel) {
-    for (const cmd of checks) byCmd.set(cmd, await run(cmd));
-  } else {
-    const builds = checks.filter((cmd) => /\bbuild\b/.test(cmd));
-    const others = checks.filter((cmd) => !builds.includes(cmd));
-    for (const result of await Promise.all(others.map(run))) byCmd.set(result.cmd, result);
-    for (const cmd of builds) byCmd.set(cmd, await run(cmd));
-  }
-  return checks.map((cmd) => byCmd.get(cmd));
+// The baseline of the autopilot run that is verifying this task, if any.
+function taskBaseline(task) {
+  if (!task || !autopilotActive()) return null;
+  const status = readJson(path.join(".codex", "autopilot", "status.json")) || {};
+  return status.slug === task ? lib.readBaseline(repoRoot, task) : null;
+}
+
+// Concurrent by default (builds last); "parallelChecks": false in verify.json runs them one
+// at a time.
+async function runChecks(checks, baseline) {
+  const results = await lib.runCommandsAsync(repoRoot, checks, { timeout: checkTimeoutMs });
+  return results.map((result) => {
+    if (result.ok) return { cmd: result.cmd, ok: true, status: result.status, tail: "" };
+    const { preexisting, newLines } = lib.classifyFailure(baseline, result.cmd, result.output);
+    return { cmd: result.cmd, ok: preexisting, preexisting, newLines, status: result.status, tail: tail(result.output, 2500) };
+  });
 }
 
 function checksReport(results, fixerReport) {
+  const verdict = (r) => (r.preexisting ? `PASS (pre-existing failures only: ${r.status}, already failing before the task started)` : r.ok ? "PASS" : `FAIL (${r.status})`);
   const lines = results.length
-    ? results.map((r) => `- \`${r.cmd}\`: ${r.ok ? "PASS" : `FAIL (${r.status})`}${r.ok || !r.tail ? "" : `\n${r.tail.replace(/^/gm, "    ")}`}`)
+    ? results.map((r) => `- \`${r.cmd}\`: ${verdict(r)}${(r.ok && !r.preexisting) || !r.tail ? "" : `\n${r.tail.replace(/^/gm, "    ")}`}`)
     : ["- No checks are configured for this repo, so none ran (add .codex/verify.json to define them)."];
   return [`Checks run by the verify script:`, ...lines, ...(fixerReport ? ["", "Claude fix step:", fixerReport] : [])].join("\n");
 }
@@ -364,7 +320,8 @@ function checksTools(checks) {
 }
 
 async function stepChecks(checks, task) {
-  let results = await runChecks(checks);
+  const baseline = taskBaseline(task);
+  let results = await runChecks(checks, baseline);
   let fixerReport = "";
   let fixerError = null;
   if (results.some((r) => !r.ok)) {
@@ -379,7 +336,7 @@ async function stepChecks(checks, task) {
     });
     fixerError = fix.error || null;
     fixerReport = fixerError ? `Failed to start claude: ${fixerError.message}` : tail(fix.text, 1500);
-    if (!fixerError) results = await runChecks(checks);
+    if (!fixerError) results = await runChecks(checks, baseline);
   }
   return { results, fixerReport, ok: results.every((r) => r.ok) };
 }
@@ -570,7 +527,8 @@ async function runVerification() {
 
   const checksText = [liveBlock ? "MUST REMOVE BEFORE COMMIT: the change adds an Impeccable live-mode block.\n" : "", checksReport(checksResult.results, checksResult.fixerReport)].join("");
   fs.appendFileSync(logPath, `${checksText}\n`);
-  const checksStatus = checks.length === 0 ? "none" : checksResult.ok ? "pass" : "fail";
+  const carried = checksResult.results.filter((r) => r.preexisting).map((r) => r.cmd);
+  const checksStatus = checks.length === 0 ? "none" : !checksResult.ok ? "fail" : carried.length ? `pass (pre-existing failures: ${carried.join(", ")})` : "pass";
 
   const reviewed = lib.snapshot(repoRoot);
   const passed = alignment.verdict === "PASS" && checksResult.ok && uiAudit.status !== "NEEDS REWORK";

@@ -18,6 +18,8 @@ A reusable setup for any project, new or existing, on any stack, on Windows, mac
 - **Ask on every plan.** For every new plan that changes app code, Claude asks: Codex implements (Claude orchestrates), Claude implements, or Codex with manual phases.
 - **Criteria-checked plans.** As orchestrator, Claude writes a phased plan whose acceptance items have ids, and whose phases each declare Scope, Steps, Covers, Done when, Hands off (what the next phase relies on) and a runnable Gate. UI plans also carry a UI audit section. `autopilot.js check` enforces all of it before handoff.
 - **Automatic handoff.** `autopilot.js handoff` posts `Execute .codex/plans/<task>.md ...` into the Codex session open in the repo (terminal or IDE) with `codex queue`, and says which session it used. Nothing to paste.
+- **Failure baseline.** `begin` runs every gate and check on the untouched tree. Failures that were already there (errors in files the task never touches, a missing dependency) don't block gates or checks later; only new output lines do. `"baseline": false` in `.codex/verify.json` turns it off.
+- **No silent stops.** Codex runs `autopilot.js stop --reason "..."` when it can't go on, the 3rd gate failure in a row stops the run, and `wait` marks the run stuck (with Codex's last message) if Codex's turn ends or its session closes mid-run.
 - **Automatic review.** Claude runs `autopilot.js wait` in the background. When Codex finishes, Claude reads the per-phase reports, runs a final Playwright UI audit for UI plans, and reports, without being asked.
 - **Parallel verification.** After each phase, Step A (checks, plus fixes for lint and type errors), Step B (alignment review) and Step C (Playwright UI audit, for UI phases) run at the same time in the background.
 - **No agent ever commits or pushes.** Every change stays in the working tree for you to review and commit. Progress is tracked with snapshots (git tree objects that aren't commits and aren't on any branch).
@@ -75,6 +77,7 @@ node .codex/autopilot.js begin  .codex/plans/<slug>.md       # starting snapshot
 node .codex/autopilot.js triage .codex/plans/<slug>.md       # Claude triages Codex's plan findings
 node .codex/autopilot.js phase  .codex/plans/<slug>.md <N>   # snapshot the phase's starting tree
 node .codex/autopilot.js verify .codex/plans/<slug>.md <N>   # gate, then Steps A, B and C in parallel
+node .codex/autopilot.js stop   .codex/plans/<slug>.md --reason "<why>"   # Codex can't go on: run marked stuck
 node .codex/autopilot.js close  .codex/plans/<slug>.md       # graphify update + task summary, in parallel
 ```
 
@@ -84,7 +87,7 @@ node .codex/autopilot.js close  .codex/plans/<slug>.md       # graphify update +
    - `triage` checks that the phases above the findings weren't changed. Then a headless Claude run (Sonnet, medium effort) marks each finding ACCEPTED or REJECTED and folds the accepted ones into the plan. It can only edit that plan file.
 3. **Each phase:**
    - `phase N` snapshots the working tree, then Codex implements the phase.
-   - `verify N` runs the gate. If the gate fails (exit 2), Codex fixes it and runs `verify` again.
+   - `verify N` runs the gate. Failures that match the baseline don't count. If the gate has new failures (exit 2), Codex fixes them and runs `verify` again. The 3rd failure in a row stops the run as stuck. If the fix is out of the phase's reach, Codex runs `stop --reason`.
    - When the gate passes, `verify` runs `claude-verify.js --run` against the phase's starting snapshot. On NEEDS REWORK (exit 3) the output includes the combined report. Codex reworks and verifies again, up to 2 times. A third NEEDS REWORK stops the run as `stuck` (exit 4).
 4. **Close.** `close` runs `graphify update .` while a headless Claude run (Sonnet, low effort) writes `.codex/tasks/<date>-<slug>.md`. Codex ends with `Task <slug> done. Claude is reviewing it.`
 

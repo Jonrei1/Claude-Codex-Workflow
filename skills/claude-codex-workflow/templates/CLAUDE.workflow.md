@@ -32,7 +32,9 @@ files and never add them to `.gitignore`: teammates must not see workflow change
        block for the user to paste.
     4. Start `node .codex/autopilot.js wait .codex/plans/<slug>.md` with Bash
        `run_in_background: true`, tell the user Codex is running and you're watching, and
-       stop. Don't start Codex or `autopilot.js run` yourself.
+       stop. Don't start Codex or `autopilot.js run` yourself. `wait` ends on its own when the
+       run is done or stuck, including when Codex stops without finishing. If it prints
+       "Codex is waiting for your approval/input", the user needs to answer in the Codex panel.
   - **Codex, manual phases:** the same, but hand off with `--phase 1` and the user drives
     later phases (`handoff ... --phase <N>`). The Codex Stop hook verifies each phase.
 - **Review when Codex finishes:** when `wait` exits, Claude reviews without being asked.
@@ -40,12 +42,22 @@ files and never add them to `.gitignore`: teammates must not see workflow change
     `*.alignment.md`, `*.checks.log`, `*.ui-audit.md`), and spot-check the diff
     (`git diff`, `git status`). If the plan has `ui: yes`, run the **final UI audit** below.
     Then report: what shipped, per-phase verdicts, UI audit result, anything to look at
-    before committing. If there are real problems, propose a rework plan and ask before
-    handing it off.
-  - **stuck (4) or failed (1):** explain the reason from the summary and the reports. Fix the
-    plan if that's the cause, then ask the user before sending
-    `node .codex/autopilot.js handoff .codex/plans/<slug>.md --continue` and waiting again.
+    before committing. If the summary lists failures that were already there before the task
+    (the baseline), say they weren't caused by this task and offer a separate plan to fix
+    them. If there are real problems, propose a rework plan and ask before handing it off.
+  - **stuck (4) or failed (1):** this covers Codex running `stop`, a gate failing 3 times,
+    too many reworks, and `wait` noticing that Codex's turn ended or its session closed
+    mid-run ("Codex stopped without finishing"). Explain the reason, quoting "Codex's last
+    message" when it's printed. Then say what unblocks it:
+    - **Environment** (a missing dependency, a tool, credentials, a pre-existing error that
+      still blocks): tell the user the exact fix (for example `npm i exceljs`).
+    - **Plan** (wrong scope, a gate that can't pass): fix the plan.
+    Ask the user before sending `node .codex/autopilot.js handoff .codex/plans/<slug>.md --continue`
+    and waiting again. If the summary says the run was NOT STARTED, hand it off again without
+    `--continue`.
   - **timed out (6):** say Codex never started or is still running; offer to wait again.
+  - Every outcome ends with a message to the user. Never end the turn with `wait` gone and
+    nothing reported.
 - **Plans:** Orchestrator plans follow `.codex/plans/_template.md`. `check` enforces:
   - frontmatter `task` (the file name), `risk`, `review`, `ui: yes|no`;
   - `## Acceptance` items with ids (`- A1: ...`), each covered by some phase's `**Covers:**`;

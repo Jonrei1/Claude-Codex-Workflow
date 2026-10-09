@@ -161,12 +161,12 @@ Minimal Linux systems may need OS libraries for Chromium. With administrator app
 
    High-risk work enables Codex plan review.
 3. **Automatic handoff.** Once you approve, Claude runs `node .codex/autopilot.js handoff .codex/plans/<task>.md`. It asks the Codex app-server which Codex session is open in this repo right now (a terminal in your IDE counts, even before you've typed anything), posts `Execute .codex/plans/<task>.md ...` into it with `codex queue`, and tells you which session it used. With none open, it waits up to 90 s for you to start one (`--wait <seconds>`, or `handoff.waitSeconds` in `.codex/verify.json`). If no session turns up, it prints the line to paste. It never opens a new window unless you pass `--new-terminal`. Claude then runs `autopilot.js wait` in the background and you can keep working.
-4. **Preflight and optional plan review.** The helper validates phases and snapshots the working tree. Existing uncommitted work becomes the starting baseline. When enabled, Codex appends plan findings and headless Claude triages them before implementation.
-5. **Implement each phase.** Codex edits scoped files; the helper runs the gate. Gate failures return to Codex for fixes. After the gate passes, three verification steps start **in parallel**, so a phase takes as long as the slowest one:
+4. **Preflight and optional plan review.** The helper validates phases and snapshots the working tree. Existing uncommitted work becomes the starting snapshot. It also records the **failure baseline**: every gate and check runs once on the untouched tree. Errors that already exist (say, a missing dependency in a file the task never touches) are noted and won't block later gates or checks. Only output lines that are new since the task started count. Line numbers, counts and timings are ignored when comparing. Turn it off with `"baseline": false` in `.codex/verify.json`. When enabled, Codex appends plan findings and headless Claude triages them before implementation.
+5. **Implement each phase.** Codex edits scoped files; the helper runs the gate. New gate failures go back to Codex with the new lines listed first. After 3 failures in a row the run stops as `stuck`. If Codex can't continue within the phase's scope (it needs other files, a dependency install, a decision), it runs `autopilot.js stop --reason "..."`, which marks the run `stuck` so Claude hears about it. After the gate passes, three verification steps start **in parallel**, so a phase takes as long as the slowest one:
 
    | Step | Default model / effort | Behavior |
    |---|---|---|
-   | A: checks | None when checks pass; Sonnet / low only to fix a failure | Runs detected or configured checks concurrently (build checks last, on their own). If one fails, Claude fixes lint, formatting and type errors; the checks then re-run. |
+   | A: checks | None when checks pass; Sonnet / low only to fix a failure | Runs detected or configured checks concurrently (build checks last, on their own). A check that fails only with baseline errors passes. Otherwise Claude fixes the new lint, formatting and type errors and leaves pre-existing ones alone; the checks then re-run. |
    | B: alignment | Sonnet / medium; Opus for high risk or configured risk paths | Reads the plan and diff, and reports Done when / Covers / Hands off, scope, gate and risks. Editing tools are denied. |
    | C: UI audit | Sonnet / medium, only for UI phases | Playwright audit of the running app at each viewport. Report-only. |
 
@@ -178,6 +178,8 @@ Minimal Linux systems may need OS libraries for Chromium. With administrator app
    - reports to you.
 
    On `stuck` or `failed` it explains why and asks before sending Codex `--continue`. You review the changes and commit them.
+
+   `wait` never hangs on a Codex that stopped. It watches the Codex session the plan went to. If Codex's turn ends, or the session closes, while the run is still going, `wait` marks the run `stuck` within about a minute and passes Codex's last message to Claude. If Codex is waiting for your approval in its panel, `wait` says so.
 
 Snapshots use a temporary Git index and tree objects; they do not change your real staging index or create branch commits. During helper-driven execution, the Stop hook stays quiet to avoid overlapping verification. In manual phase mode, the Stop hook launches the same parallel verification after Codex ends its turn; wait for `Finished` in the log before another edit turn.
 
@@ -292,6 +294,8 @@ Every artifact below is local to your clone and hidden through `.git/info/exclud
 - **No browser tests ran:** MCP tools are used when requested. Add actual project specs and their command to gates/checks for repeatable assertions.
 - **Plan didn't reach Codex:** `handoff` posts to the newest Codex session that's open in this repo, as reported by the Codex app-server daemon. Keep Codex running in a terminal there. If the output says it couldn't ask the app-server, run `codex app-server daemon version` to check the daemon. You can also pin a session with `handoff.thread` in `.codex/verify.json` or `--thread <id>`, or use `--new-terminal`. Exit 5 means it printed the line to paste instead.
 - **`wait` timed out:** Codex never ran `begin` (the message didn't arrive, or the session was busy). Check the Codex session, then ask Claude to wait again.
+- **"Codex stopped without finishing":** Codex's turn ended mid-run without `close` or `stop`. Claude shows Codex's last message. Fix what it describes, then let Claude send `handoff --continue`.
+- **A gate fails on errors you didn't cause:** if they existed when the task began, the baseline already excludes them. If they appeared mid-task from outside the plan (a pulled branch, a removed package), fix them or re-run the plan so `begin` records a new baseline.
 - **UI audit BLOCKED:** nothing answered at the URL and the start command failed or timed out; see `.codex/verify/<task>/phase-<N>.app.log`. BLOCKED is reported but doesn't fail the phase.
 - **`stuck` run:** read the findings, resolve the code or plan decision, and let Claude send `handoff --continue`.
 - **`failed` run:** read the reason/logs, fix authentication, permissions, network or command failure, then continue. Helper-launched agent calls have a 30-minute timeout each.

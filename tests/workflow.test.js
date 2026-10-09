@@ -376,10 +376,9 @@ test("wait returns when the run is done, with a summary, and 4 when it's stuck",
 
 // ---- verification runs its steps in parallel ----
 
-test("verify runs the checks fix step and the alignment review at the same time, and keeps per-task reports", () => {
-  const dir = workflowRepo();
-  write(dir, ".codex/verify.json", JSON.stringify({ checks: ['node -e "process.exit(1)"'] }));
-  write(dir, "src/api/badge.js", "module.exports = 1;\n");
+// A headless-claude stand-in on PATH. It answers the alignment review with PASS and records
+// each call (name, start, end) in times.jsonl.
+function fakeClaude() {
   const bin = tempDir("ccw-claude-");
   const times = path.join(bin, "times.jsonl");
   const fake = path.join(bin, "fake-claude.js");
@@ -401,15 +400,181 @@ setTimeout(() => {
     fs.writeFileSync(path.join(bin, "claude"), `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`);
     fs.chmodSync(path.join(bin, "claude"), 0o755);
   }
+  const calls = () => (fs.existsSync(times) ? fs.readFileSync(times, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : []);
+  return { bin, calls, env: { PATH: `${bin}${path.delimiter}${process.env.PATH}` } };
+}
+
+// ---- baseline: failures that were there before the task ----
+
+test("diagnostic lines ignore locations, counts and timings, but count repeats", () => {
+  const before = lib.diagnosticLines("src/a.ts(10,5): error TS2307: Cannot find module 'exceljs'.\nFound 4 errors in 1 file. Done in 3.2s");
+  assert.deepStrictEqual(lib.newFailureLines("src/a.ts(42,5): error TS2307: Cannot find module 'exceljs'.\nFound 5 errors in 1 file. Done in 9.9s", before), []);
+  const twice = "src/a.ts(1,1): error TS2307: Cannot find module 'exceljs'.\nsrc/a.ts(9,1): error TS2307: Cannot find module 'exceljs'.";
+  assert.deepStrictEqual(lib.newFailureLines(twice, before), ["src/a.ts(9,1): error TS2307: Cannot find module 'exceljs'."]);
+  assert.deepStrictEqual(lib.newFailureLines("src/b.ts:3:7 error no-unused-vars", before), ["src/b.ts:3:7 error no-unused-vars"]);
+});
+
+const gatePlan = `---
+task: fix-label
+risk: normal
+review: none
+ui: no
+---
+
+# Fix the label
+
+## Acceptance
+- A1: the label reads right
+
+## Phase 1: Label
+**Scope:** src/label.js
+**Steps:**
+1. Fix the label.
+**Covers:** A1
+**Done when:** the label reads right.
+**Gate (must pass):**
+- \`node gate.js\`
+`;
+
+const oldError = "src/old.ts(1,23): error TS2307: Cannot find module 'exceljs'.";
+
+// A repo whose gate prints errors.txt and fails when it isn't empty.
+function gateRepo(errors) {
+  const dir = gitRepo();
+  const result = install(dir);
+  assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+  write(dir, ".codex/plans/fix-label.md", gatePlan);
+  write(dir, ".codex/verify.json", JSON.stringify({ checks: [] }));
+  write(dir, "gate.js", 'const fs = require("fs");\nconst text = fs.existsSync("errors.txt") ? fs.readFileSync("errors.txt", "utf8") : "";\nprocess.stdout.write(text);\nprocess.exit(text.trim() ? 1 : 0);\n');
+  write(dir, "errors.txt", errors);
+  return dir;
+}
+
+function step(dir, args, env = {}) {
+  return autopilot(dir, [args[0], ".codex/plans/fix-label.md", ...args.slice(1)], env);
+}
+
+test("begin records a baseline, and a gate failing only with those errors doesn't block", () => {
+  const dir = gateRepo(`${oldError}\nFound 1 error.\n`);
+  const claude = fakeClaude();
+  let result = step(dir, ["begin"]);
+  assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /baseline: "node gate\.js" already fails before the task/);
+  assert.strictEqual(step(dir, ["phase", "1"]).status, 0);
+  write(dir, "src/label.js", "module.exports = 'right';\n");
+  // The same error, moved to another line, is still the pre-existing one.
+  write(dir, "errors.txt", `${oldError.replace("(1,23)", "(7,23)")}\nFound 1 error.\n`);
+  result = step(dir, ["verify", "1"], claude.env);
+  assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /fails only with errors that were there before the task started; not blocking/);
+  assert.match(result.stdout, /VERDICT: PASS/);
+  const status = JSON.parse(read(dir, ".codex/autopilot/status.json"));
+  assert.deepStrictEqual(status.phases["1"].preexisting, ["node gate.js"]);
+});
+
+test("a gate with a new failure exits 2 and lists what's new; the 3rd failure stops the run", () => {
+  const dir = gateRepo(`${oldError}\n`);
+  assert.strictEqual(step(dir, ["begin"]).status, 0);
+  assert.strictEqual(step(dir, ["phase", "1"]).status, 0);
+  write(dir, "errors.txt", `${oldError}\nsrc/label.js(2,1): error TS2322: Type 'number' is not assignable to type 'string'.\n`);
+  let result = step(dir, ["verify", "1"]);
+  assert.strictEqual(result.status, 2, result.stdout + result.stderr);
+  assert.match(result.stdout, /GATE FAILED \(try 1 of 3\)/);
+  assert.match(result.stdout, /New since the task started:\nsrc\/label\.js\(2,1\): error TS2322/);
+  assert.match(result.stdout, /autopilot\.js stop \.codex\/plans\/fix-label\.md --reason/);
+  assert.strictEqual(step(dir, ["verify", "1"]).status, 2);
+  result = step(dir, ["verify", "1"]);
+  assert.strictEqual(result.status, 4, result.stdout + result.stderr);
+  const status = JSON.parse(read(dir, ".codex/autopilot/status.json"));
+  assert.strictEqual(status.state, "stuck");
+  assert.match(status.reason, /still fails after 3 tries/);
+});
+
+test("stop marks the run stuck with Codex's reason, and wait reports it", () => {
+  const dir = gateRepo("");
+  const since = new Date(Date.now() - 1000).toISOString();
+  assert.strictEqual(step(dir, ["begin"]).status, 0);
+  assert.strictEqual(step(dir, ["phase", "1"]).status, 0);
+  let result = step(dir, ["stop", "--reason", "needs the exceljs package installed"]);
+  assert.strictEqual(result.status, 4, result.stdout + result.stderr);
+  const status = JSON.parse(read(dir, ".codex/autopilot/status.json"));
+  assert.strictEqual(status.state, "stuck");
+  assert.match(status.reason, /needs the exceljs package installed \(at phase 1, step implement\)/);
+  result = step(dir, ["wait", "--since", since, "--timeout", "30"]);
+  assert.strictEqual(result.status, 4, result.stdout + result.stderr);
+  assert.match(result.stdout, /STUCK -- needs the exceljs package installed/);
+});
+
+// A run that began and is still "running", handed off to Codex session `thread`.
+function runningRepo(thread) {
+  const dir = gateRepo("");
+  assert.strictEqual(step(dir, ["begin"]).status, 0);
+  assert.strictEqual(step(dir, ["phase", "1"]).status, 0);
+  const at = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  write(dir, ".codex/autopilot/handoff.json", JSON.stringify({ slug: "fix-label", plan: ".codex/plans/fix-label.md", via: "codex queue", thread, at }));
+  return dir;
+}
+
+const fastWait = { CCW_WAIT_POLL_MS: "100", CCW_WAIT_CHECK_MS: "200", CCW_WAIT_QUIET_MS: "1", CCW_WAIT_GRACE_MS: "1" };
+
+test("wait notices Codex stopped without finishing and passes on its last message", () => {
+  const dir = runningRepo(liveId);
+  const lastMessage = "Execution stopped at the TypeScript gate: master-product-export.service.ts is missing exceljs.";
+  const codex = fakeCodex({
+    threads: [liveThread(liveId, dir, { turns: [{ status: "completed", items: [{ type: "userMessage", content: [] }, { type: "agentMessage", text: lastMessage }] }] })],
+  });
+  const result = step(dir, ["wait", "--timeout", "60"], { ...codex.env, ...fastWait });
+  assert.strictEqual(result.status, 4, result.stdout + result.stderr);
+  assert.match(result.stdout, /STUCK -- Codex stopped without finishing the run \(last step: implement, phase 1\)/);
+  assert.match(result.stdout, /Codex's last message:\n\s+Execution stopped at the TypeScript gate/);
+  assert.strictEqual(JSON.parse(read(dir, ".codex/autopilot/status.json")).state, "stuck");
+});
+
+test("wait notices the Codex session was closed mid-run", () => {
+  const dir = runningRepo(liveId);
+  const result = step(dir, ["wait", "--timeout", "60"], { ...fakeCodex({ threads: [] }).env, ...fastWait });
+  assert.strictEqual(result.status, 4, result.stdout + result.stderr);
+  assert.match(result.stdout, /the Codex session was closed before the run finished/);
+});
+
+test("wait keeps waiting while Codex is working", () => {
+  const dir = runningRepo(liveId);
+  const codex = fakeCodex({ threads: [liveThread(liveId, dir, { status: { type: "active", activeFlags: ["waitingOnApproval"] } })] });
+  const result = step(dir, ["wait", "--timeout", "2"], { ...codex.env, ...fastWait });
+  assert.strictEqual(result.status, 6, result.stdout + result.stderr);
+  assert.match(result.stdout, /Codex is waiting for your approval in its panel/);
+});
+
+test("verify's checks step passes a check that only fails with pre-existing errors and doesn't send it to the fixer", () => {
+  const dir = gateRepo("");
+  write(dir, "check.js", `process.stdout.write(${JSON.stringify(oldError)}); process.exit(1);\n`);
+  write(dir, ".codex/verify.json", JSON.stringify({ checks: ["node check.js"] }));
+  assert.strictEqual(step(dir, ["begin"]).status, 0);
+  assert.strictEqual(step(dir, ["phase", "1"]).status, 0);
+  write(dir, "src/label.js", "module.exports = 'right';\n");
+  const claude = fakeClaude();
+  const result = step(dir, ["verify", "1"], claude.env);
+  assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+  const state = JSON.parse(read(dir, ".codex/verify/state.json"));
+  assert.match(state.lastChecks, /^pass \(pre-existing failures: node check\.js\)/);
+  assert.strictEqual(state.lastVerdict, "PASS");
+  assert.ok(!claude.calls().some((call) => call.name === "fix"), "the fixer must not run for pre-existing failures");
+});
+
+test("verify runs the checks fix step and the alignment review at the same time, and keeps per-task reports", () => {
+  const dir = workflowRepo();
+  write(dir, ".codex/verify.json", JSON.stringify({ checks: ['node -e "process.exit(1)"'] }));
+  write(dir, "src/api/badge.js", "module.exports = 1;\n");
+  const claude = fakeClaude();
   const base = lib.headTree(dir) || "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
   const result = spawnSync(process.execPath, [path.join(dir, ".codex/hooks/claude-verify.js"), "--run", "--base", base, "--plan", ".codex/plans/add-badge.md", "--phase", "1", "--gate", "passed"], {
     cwd: dir,
     encoding: "utf8",
-    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` },
+    env: { ...process.env, ...claude.env },
   });
   assert.strictEqual(result.status, 0, result.stdout + result.stderr);
 
-  const calls = fs.readFileSync(times, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const calls = claude.calls();
   const fix = calls.find((call) => call.name === "fix");
   const alignment = calls.find((call) => call.name === "alignment");
   assert.ok(fix && alignment, JSON.stringify(calls));

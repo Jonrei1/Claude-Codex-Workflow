@@ -535,6 +535,147 @@ function usageSummary(repoRoot, task) {
   return out.join("\n");
 }
 
+// ---- Project checks and the failure baseline -----------------------------------------
+//
+// The checks come from .codex/verify.json "checks", else from markers at the repo root.
+// An autopilot run records a baseline when it begins: every gate and check, run on the
+// untouched starting tree. A failure later counts only if its output has lines the
+// baseline didn't, so errors that were already in the repo don't block the run.
+
+function nodeChecks(repoRoot) {
+  const has = (name) => fs.existsSync(path.join(repoRoot, name));
+  const pkg = readJsonFile(path.join(repoRoot, "package.json"));
+  if (!pkg) return [];
+  const scripts = pkg.scripts || {};
+  const pm = has("pnpm-lock.yaml") ? "pnpm" : has("yarn.lock") ? "yarn" : has("bun.lock") || has("bun.lockb") ? "bun" : "npm";
+  const run = { npm: "npm run", pnpm: "pnpm", yarn: "yarn", bun: "bun run" }[pm];
+  const exec = { npm: "npx", pnpm: "pnpm exec", yarn: "yarn", bun: "bunx" }[pm];
+
+  const checks = [];
+  if (scripts.typecheck) checks.push(`${run} typecheck`);
+  else if (has("tsconfig.json")) checks.push(`${exec} tsc --noEmit`);
+  if (scripts.lint) checks.push(`${run} lint`);
+  if (scripts.build) checks.push(`${run} build`);
+  const test = scripts.test || "";
+  if (test && !test.includes("no test specified") && !test.includes("watch")) {
+    checks.push(`${run} test`);
+  }
+  return checks;
+}
+
+function pythonChecks(repoRoot) {
+  const has = (name) => fs.existsSync(path.join(repoRoot, name));
+  const hasPython = has("pyproject.toml") || has("setup.cfg") || fs.readdirSync(repoRoot).some((file) => /^requirements.*\.txt$/.test(file));
+  if (!hasPython) return [];
+  let pyproject = "";
+  try {
+    pyproject = fs.readFileSync(path.join(repoRoot, "pyproject.toml"), "utf8");
+  } catch {
+    // no pyproject.toml
+  }
+  const checks = [];
+  if (pyproject.includes("[tool.ruff") || has("ruff.toml") || has(".ruff.toml")) checks.push("ruff check .");
+  if (pyproject.includes("[tool.mypy") || has("mypy.ini")) checks.push("mypy .");
+  if (pyproject.includes("[tool.pytest") || has("pytest.ini") || has("tests")) checks.push("pytest -q");
+  return checks;
+}
+
+function detectChecks(repoRoot) {
+  const override = verifyConfig(repoRoot);
+  if (Array.isArray(override.checks)) {
+    return override.checks.filter((check) => typeof check === "string" && check.trim());
+  }
+  const has = (name) => fs.existsSync(path.join(repoRoot, name));
+  return [
+    ...nodeChecks(repoRoot),
+    ...(has("Cargo.toml") ? ["cargo check", "cargo test"] : []),
+    ...(has("go.mod") ? ["go vet ./...", "go build ./...", "go test ./..."] : []),
+    ...pythonChecks(repoRoot),
+  ];
+}
+
+// Runs shell commands, concurrently by default. Builds run last, on their own, since they
+// often share output folders with other tools. Results come back in the input order.
+async function runCommandsAsync(repoRoot, commands, { timeout, env, parallel = verifyConfig(repoRoot).parallelChecks !== false } = {}) {
+  const byCmd = new Map();
+  const runOne = (cmd) => runShellAsync(repoRoot, cmd, { timeout, env });
+  if (!parallel) {
+    for (const cmd of commands) byCmd.set(cmd, await runOne(cmd));
+  } else {
+    const builds = commands.filter((cmd) => /\bbuild\b/.test(cmd));
+    const others = commands.filter((cmd) => !builds.includes(cmd));
+    for (const result of await Promise.all(others.map(runOne))) byCmd.set(result.cmd, result);
+    for (const cmd of builds) byCmd.set(cmd, await runOne(cmd));
+  }
+  return commands.map((cmd) => byCmd.get(cmd));
+}
+
+// Output lines with the noise taken out, so the same error compares equal across runs:
+// locations (file.ts(12,5), file.ts:12:5), counts and timings become placeholders.
+function diagnosticLines(output) {
+  return outputLines(output).map((line) => line.normal);
+}
+
+function outputLines(output) {
+  return String(output || "")
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+    .split(/\r?\n/)
+    .map((raw) => raw.trim())
+    .filter(Boolean)
+    .map((raw) => {
+      const normal = raw
+        .replace(/\\/g, "/")
+        .replace(/\(\d+,\d+\)/g, "(L,C)")
+        .replace(/:\d+:\d+/g, ":L:C")
+        .replace(/\d+(?:\.\d+)?/g, "N")
+        .replace(/\s+/g, " ");
+      return { raw, normal: isWindows ? normal.toLowerCase() : normal };
+    });
+}
+
+// Lines of output that the baseline didn't have (counting repeats), in their original form.
+function newFailureLines(output, baselineLines) {
+  const counts = new Map();
+  for (const line of baselineLines || []) counts.set(line, (counts.get(line) || 0) + 1);
+  const added = [];
+  for (const { raw, normal } of outputLines(output)) {
+    const left = counts.get(normal) || 0;
+    if (left > 0) counts.set(normal, left - 1);
+    else added.push(raw);
+  }
+  return added;
+}
+
+function baselinePath(repoRoot, slug) {
+  return path.join(repoRoot, ".codex", "autopilot", `${slug}.baseline.json`);
+}
+
+function readBaseline(repoRoot, slug) {
+  return slug ? readJsonFile(baselinePath(repoRoot, slug)) : null;
+}
+
+// Runs the commands on the current tree and saves the result as the task's baseline.
+async function recordBaseline(repoRoot, slug, commands, { tree = "", timeout, env } = {}) {
+  const unique = [...new Set(commands.filter(Boolean))];
+  const results = await runCommandsAsync(repoRoot, unique, { timeout, env });
+  const baseline = { tree, recorded: new Date().toISOString(), commands: {} };
+  for (const result of results) {
+    baseline.commands[result.cmd] = { ok: result.ok, status: result.status, lines: result.ok ? [] : diagnosticLines(result.output) };
+  }
+  fs.mkdirSync(path.dirname(baselinePath(repoRoot, slug)), { recursive: true });
+  fs.writeFileSync(baselinePath(repoRoot, slug), JSON.stringify(baseline, null, 2) + "\n");
+  return baseline;
+}
+
+// A failed command against the baseline: { preexisting, newLines }. preexisting is true only
+// when the command already failed before the task and every line of its output did too.
+function classifyFailure(baseline, cmd, output) {
+  const before = baseline && baseline.commands && baseline.commands[cmd];
+  if (!before) return { preexisting: false, newLines: [], known: false };
+  const newLines = newFailureLines(output, before.lines);
+  return { preexisting: !before.ok && newLines.length === 0, newLines, known: true };
+}
+
 // ---- Codex sessions ----------------------------------------------------------------------
 //
 // Every Codex TUI (terminal or IDE) runs its threads on the shared local app-server daemon,
@@ -724,6 +865,33 @@ function pickCodexSession(threads, repoRoot) {
   return { session: matches[0] || null, others: matches.slice(1) };
 }
 
+// One session's state: { status: "idle" | "active" | "notLoaded" | "systemError" | "missing",
+// flags, lastMessage } or { error } when the daemon can't be reached. lastMessage is the
+// text of Codex's latest reply (empty when the session has no saved turns yet).
+async function codexThreadState(threadId, options = {}) {
+  const loaded = await codexAppServer([{ method: "thread/loaded/list" }], options);
+  if (loaded.error) return { error: loaded.error };
+  const ids = (loaded.results[0] && loaded.results[0].data) || [];
+  if (!ids.includes(threadId)) return { status: "notLoaded", flags: [], lastMessage: "" };
+  const reply = await codexAppServer(
+    [
+      { method: "thread/read", params: { threadId, includeTurns: false } },
+      { method: "thread/read", params: { threadId, includeTurns: true } },
+    ],
+    options,
+  );
+  if (reply.error) return { error: reply.error };
+  const thread = reply.results[0] && reply.results[0].thread;
+  if (!thread) return { status: "missing", flags: [], lastMessage: "" };
+  const status = (thread.status && thread.status.type) || "idle";
+  const turns = (reply.results[1] && reply.results[1].thread && reply.results[1].thread.turns) || [];
+  let lastMessage = "";
+  for (const turn of turns) {
+    for (const item of turn.items || []) if (item && item.type === "agentMessage" && item.text) lastMessage = item.text;
+  }
+  return { status, flags: (thread.status && thread.status.activeFlags) || [], lastMessage };
+}
+
 // The open Codex session for repoRoot: { session, others } or { session: null, error }.
 async function findCodexSession(repoRoot, options = {}) {
   const live = await liveCodexThreads(options);
@@ -802,11 +970,20 @@ module.exports = {
   gateProblem,
   planChecklist,
   planProblems,
+  detectChecks,
+  runCommandsAsync,
+  diagnosticLines,
+  newFailureLines,
+  baselinePath,
+  readBaseline,
+  recordBaseline,
+  classifyFailure,
   encodeFrame,
   decodeFrames,
   codexAppServer,
   liveCodexThreads,
   pickCodexSession,
+  codexThreadState,
   findCodexSession,
   resolvePlaywright,
   playwrightMcpConfig,
