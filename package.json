@@ -1,6 +1,6 @@
 {
   "name": "claude-codex-workflow",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "One-command setup for the Claude + Codex workflow: installs Claude Code, Codex CLI, Playwright and graphify (Impeccable optional), and wires the workflow into the current project, local only (no tracked file changes).",
   "repository": "github:Jonrei1/Claude-Codex-Workflow",
   "bin": {

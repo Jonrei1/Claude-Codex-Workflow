@@ -81,6 +81,7 @@ const MANAGED = [
 ];
 const results = [];
 const changed = [];
+const notices = []; // one-line explanations --sync prints at session start
 
 function readJson(file) {
   try {
@@ -264,8 +265,8 @@ function isTracked(root, rel) {
 
 // Outside --shared, a file git tracks is never written: teammates would see the change, and
 // two developers setting up the workflow would get merge conflicts.
-function write(file, content, step, note) {
-  if (!shared && projectDir) {
+function write(file, content, step, note, { allowTracked = false } = {}) {
+  if (!shared && projectDir && !allowTracked) {
     const rel = path.relative(projectDir, file);
     if (!rel.startsWith("..") && !path.isAbsolute(rel) && isTracked(projectDir, rel)) {
       return record(step, false, "tracked by git, left unchanged (setup only writes local files; --shared allows it)");
@@ -371,6 +372,44 @@ function mergeSection(root, file, section, heading, { local = false } = {}) {
 // Merges the template hook groups into a Codex hooks file. Groups whose commands are already
 // present are skipped, an older workflow Stop command is upgraded in place, and Impeccable's
 // Windows launcher is repaired. `events` limits which template events are merged.
+// Impeccable's own installer writes a Windows command of the form `if exist "x" ("x" hook & exit /b)`.
+// Codex can run it through PowerShell, where that is a syntax error, so the hook fails on every
+// event. The cmd.exe wrapper below runs the same thing from PowerShell and cmd alike.
+const IMPECCABLE_WINDOWS = 'cmd.exe /d /c "if exist .agents\\skills\\impeccable\\scripts\\impeccable.cmd .agents\\skills\\impeccable\\scripts\\impeccable.cmd hook"';
+const IMPECCABLE_HOOK = /\.agents\/skills\/impeccable\/scripts\/impeccable(?:\.cmd)?["']?\s+hook\b/;
+
+// Fixes one Impeccable hook entry in place. Returns true when it changed.
+function repairImpeccableHook(hook) {
+  if (hook.type !== "command") return false;
+  const isImpeccable = [hook.command, hook.commandWindows].some((command) => typeof command === "string" && IMPECCABLE_HOOK.test(command.replace(/\\/g, "/")));
+  if (!isImpeccable || hook.commandWindows === IMPECCABLE_WINDOWS) return false;
+  hook.commandWindows = IMPECCABLE_WINDOWS;
+  return true;
+}
+
+// Repairs the Impeccable hooks in a Codex hooks file and touches nothing else. A tracked file is
+// repaired too: the hook is broken for everyone who has it, and the change is only its
+// commandWindows line, which you can commit.
+function repairImpeccableHooks(file, step) {
+  const text = readText(file);
+  if (text === null || !text.includes("impeccable")) return;
+  let config;
+  try {
+    config = JSON.parse(text);
+  } catch {
+    return;
+  }
+  let repaired = 0;
+  for (const groups of Object.values(config.hooks || {})) {
+    for (const group of groups) for (const hook of group.hooks || []) if (repairImpeccableHook(hook)) repaired++;
+  }
+  if (!repaired) return;
+  const tracked = projectDir && isTracked(projectDir, path.relative(projectDir, file));
+  const note = `fixed ${repaired} Impeccable Windows hook(s) that failed on every event${tracked ? "; the file is tracked, so commit the change" : ""}; trust the hooks again in Codex (/hooks)`;
+  write(file, JSON.stringify(config, null, 2) + "\n", step, note, { allowTracked: true });
+  if (changed.includes(step)) notices.push(`${step}: ${note}`);
+}
+
 // graphify may be installed at a full path; compare hook commands without it.
 const normalizeCommand = (command) => String(command).replace(/^"?[^"]*?graphify(\.exe)?"? hook-guard/i, "graphify hook-guard");
 
@@ -387,22 +426,17 @@ function mergeHooks(file, step, { graphify, events } = {}) {
   }
   config.hooks = config.hooks || {};
   let repaired = 0;
-  const impeccableWindows = 'cmd.exe /d /c "if exist .agents\\skills\\impeccable\\scripts\\impeccable.cmd .agents\\skills\\impeccable\\scripts\\impeccable.cmd hook"';
   const verifyHook = wanted.hooks.Stop[0].hooks[0];
   for (const groups of Object.values(config.hooks)) {
     for (const group of groups) {
       for (const hook of group.hooks || []) {
         if (hook.type !== "command") continue;
-        const commands = [hook.command, hook.commandWindows];
         if (typeof hook.command === "string" && hook.command.includes("claude-verify.js") && hook.command !== verifyHook.command) {
           Object.assign(hook, verifyHook);
           repaired++;
           continue;
         }
-        if (!commands.some((command) => typeof command === "string" && /\.agents\/skills\/impeccable\/scripts\/impeccable(?:\.cmd)?["']?\s+hook\b/.test(command.replace(/\\/g, "/")))) continue;
-        if (hook.commandWindows === impeccableWindows) continue;
-        hook.commandWindows = impeccableWindows;
-        repaired++;
+        if (repairImpeccableHook(hook)) repaired++;
       }
     }
   }
@@ -431,6 +465,7 @@ function codexHome() {
 function mergeProjectHooks(root, graphify, label = "") {
   const rel = ".codex/hooks.json";
   if (!shared && isTracked(root, rel)) {
+    repairImpeccableHooks(path.join(root, rel), `${rel}${label}`);
     return mergeHooks(path.join(codexHome(), "hooks.json"), `~/.codex/hooks.json${label}`, { events: ["Stop"] });
   }
   mergeHooks(path.join(root, rel), `${rel}${label}`, { graphify });
@@ -633,6 +668,10 @@ function projectRoot() {
 function syncProject() {
   const root = projectRoot();
   if (!root) return;
+  // Independent of the workflow: a broken Impeccable hook fails on every Codex event.
+  projectDir = root;
+  repairImpeccableHooks(path.join(root, ".codex", "hooks.json"), ".codex/hooks.json");
+  repairImpeccableHooks(path.join(codexHome(), "hooks.json"), "~/.codex/hooks.json");
   const manifest = readJson(path.join(root, MANIFEST));
   if (!manifest) {
     if (readText(path.join(root, ".codex", "autopilot.js")) !== null) {
@@ -644,10 +683,14 @@ function syncProject() {
   if (manifest.version && compareVersions(manifest.version, pluginVersion) > 0) return;
   shared = Boolean(manifest.shared);
   setupProject(root, "", false);
+}
+
+function announceChanges() {
+  for (const notice of notices) console.log(`claude-codex-workflow: ${notice}`);
   const files = changed.filter((file) => file !== MANIFEST);
   if (files.length) {
     console.log(
-      `claude-codex-workflow v${pluginVersion}: synced ${files.length} project file(s) (${files.join(", ")}). ` +
+      `claude-codex-workflow v${pluginVersion}: updated ${files.length} project file(s) (${files.join(", ")}). ` +
         "Restart Claude Code and Codex so the updated workflow applies.",
     );
   }
@@ -658,6 +701,7 @@ async function main() {
   if (sync) {
     try {
       syncProject();
+      announceChanges();
     } catch (error) {
       console.log(`claude-codex-workflow sync skipped: ${error.message}`);
     }

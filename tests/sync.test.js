@@ -43,7 +43,7 @@ test("sync replaces a stale autopilot, removes dropped scripts and updates the w
 
   const result = installerRun(dir, ["--sync"]);
   assert.strictEqual(result.status, 0);
-  assert.match(result.stdout, /synced/);
+  assert.match(result.stdout, /updated/);
   assert.doesNotMatch(read(dir, ".codex/autopilot.js"), /STALE-MARKER/);
   assert.ok(!fs.existsSync(path.join(dir, ".codex", "old-script.js")));
   assert.ok(fs.existsSync(path.join(dir, ".codex", "user-script.js")));
@@ -99,4 +99,56 @@ test("setup leaves git status clean, including the manifest", () => {
   const dir = tempProject();
   const status = spawnSync("git", ["status", "--porcelain"], { cwd: dir, encoding: "utf8" }).stdout;
   assert.strictEqual(status.trim(), "");
+});
+
+const BROKEN_WINDOWS = 'if exist ".agents/skills/impeccable/scripts/impeccable.cmd" (".agents/skills/impeccable/scripts/impeccable.cmd" hook & exit /b)';
+
+function impeccableHooks() {
+  const hook = (timeout) => ({
+    type: "command",
+    command: '[ ! -f ".agents/skills/impeccable/scripts/impeccable" ] || ".agents/skills/impeccable/scripts/impeccable" hook',
+    commandWindows: BROKEN_WINDOWS,
+    timeout,
+  });
+  return { hooks: { Stop: [{ hooks: [hook(30)] }], PostToolUse: [{ matcher: "Edit|Write", hooks: [hook(5)] }] } };
+}
+
+test("sync fixes Impeccable's broken Windows hook, even in a tracked hooks.json with no workflow manifest", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccw-imp-"));
+  const git = (...args) => spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+  git("init", "-q");
+  const file = path.join(dir, ".codex", "hooks.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(impeccableHooks(), null, 2));
+  git("add", ".codex/hooks.json");
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "hooks");
+
+  const result = installerRun(dir, ["--sync"]);
+  assert.match(result.stdout, /fixed 2 Impeccable Windows hook/);
+  assert.match(result.stdout, /commit the change/);
+  const fixed = JSON.parse(fs.readFileSync(file, "utf8"));
+  for (const hook of [fixed.hooks.Stop[0].hooks[0], fixed.hooks.PostToolUse[0].hooks[0]]) {
+    assert.match(hook.commandWindows, /^cmd\.exe \/d \/c "if exist /);
+    assert.doesNotMatch(hook.commandWindows, /exit \/b/);
+    assert.match(hook.command, /^\[ ! -f/); // the POSIX command is untouched
+  }
+  assert.strictEqual(installerRun(dir, ["--sync"]).stdout, ""); // nothing left to repair
+});
+
+test("the repaired Impeccable command runs under PowerShell and cmd", { skip: process.platform !== "win32" }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccw-imp-run-"));
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  const script = path.join(dir, ".agents", "skills", "impeccable", "scripts", "impeccable.cmd");
+  fs.mkdirSync(path.dirname(script), { recursive: true });
+  fs.writeFileSync(script, "@echo off\r\necho ran %1\r\nexit /b 0\r\n");
+  const file = path.join(dir, ".codex", "hooks.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(impeccableHooks()));
+  installerRun(dir, ["--sync"]);
+  const command = JSON.parse(fs.readFileSync(file, "utf8")).hooks.Stop[0].hooks[0].commandWindows;
+  for (const shell of [["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command], ["cmd.exe", "/d", "/s", "/c", command]]) {
+    const result = spawnSync(shell[0], shell.slice(1), { cwd: dir, encoding: "utf8", windowsHide: true, windowsVerbatimArguments: shell[0] === "cmd.exe" });
+    assert.strictEqual(result.status, 0, `${shell[0]}: ${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /ran hook/, shell[0]);
+  }
 });
