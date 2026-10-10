@@ -1,30 +1,19 @@
 "use strict";
 
 const fs = require("node:fs");
-const path = require("node:path");
-const { createRequire } = require("node:module");
+// Use the MCP package's Playwright dependency so the downloaded browser matches it. Shared with
+// the verify step's UI audit, which starts the same server for headless Claude.
+const { resolvePlaywright: resolveInstallation } = require("../templates/codex/hooks/workflow-lib");
 
-// Use the MCP package's Playwright dependency so the downloaded browser matches it.
-function resolveInstallation(globalRoot) {
-  const packageFile = path.join(globalRoot, "@playwright", "mcp", "package.json");
-  const requireMcp = createRequire(packageFile);
-  const pkg = requireMcp(packageFile);
-  const playwright = requireMcp("playwright");
-  return {
-    version: pkg.version,
-    server: path.join(path.dirname(packageFile), pkg.bin["playwright-mcp"]),
-    cli: path.join(path.dirname(requireMcp.resolve("playwright/package.json")), "cli.js"),
-    browser: playwright.chromium.executablePath(),
-  };
-}
-
-async function setupPlaywright({ run, has, confirm, record, dryRun, resolve = resolveInstallation, exists = fs.existsSync }) {
+// Claude does the UI audits, so Playwright is registered for Claude. codex: true
+// (--playwright-codex) also registers it for Codex.
+async function setupPlaywright({ run, has, confirm, record, dryRun, codex = false, resolve = resolveInstallation, exists = fs.existsSync }) {
   const clients = [
     { command: "claude", add: ["mcp", "add", "--scope", "user", "playwright", "--"] },
-    { command: "codex", add: ["mcp", "add", "playwright", "--"] },
+    ...(codex ? [{ command: "codex", add: ["mcp", "add", "playwright", "--"] }] : []),
   ];
   if (dryRun) {
-    record("Playwright MCP", null, "would install missing global @playwright/mcp, download its matching Chromium, and register missing playwright servers for Claude (user scope) and Codex");
+    record("Playwright MCP", null, `would install missing global @playwright/mcp, download its matching Chromium, and register a missing playwright server for Claude (user scope)${codex ? " and Codex" : ""}`);
     return;
   }
   const globalRoot = run("npm", ["root", "-g"], { timeout: 60 * 1000 });

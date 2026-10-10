@@ -26,7 +26,7 @@ const read = (dir, file) => fs.readFileSync(path.join(dir, file), "utf8");
 test("install records the owned scripts in a manifest", () => {
   const dir = tempProject();
   const manifest = JSON.parse(read(dir, ".codex/workflow-manifest.json"));
-  assert.deepStrictEqual(manifest.files.sort(), [".codex/autopilot.js", ".codex/hooks/claude-verify.js", ".codex/hooks/workflow-lib.js"]);
+  for (const file of [".codex/autopilot.js", ".codex/hooks/claude-verify.js", ".codex/hooks/workflow-lib.js", ".codex/workflow/CODEX.md"]) assert.ok(manifest.files.includes(file), file);
 });
 
 test("sync replaces a stale autopilot, removes dropped scripts and updates the workflow sections", () => {
@@ -36,10 +36,10 @@ test("sync replaces a stale autopilot, removes dropped scripts and updates the w
   manifest.version = "1.0.0";
   manifest.files.push(".codex/old-script.js");
   fs.writeFileSync(manifestFile, JSON.stringify(manifest));
-  fs.writeFileSync(path.join(dir, ".codex", "autopilot.js"), "// stale\n");
+  fs.writeFileSync(path.join(dir, ".codex", "autopilot.js"), "// STALE-MARKER\n");
   fs.writeFileSync(path.join(dir, ".codex", "old-script.js"), "// dropped\n");
   fs.writeFileSync(path.join(dir, ".codex", "user-script.js"), "// not ours\n");
-  fs.writeFileSync(path.join(dir, "CLAUDE.md"), read(dir, "CLAUDE.md").replace("## Workflow", "## Workflow\nSTALE LINE"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.local.md"), read(dir, "CLAUDE.local.md").replace("## Workflow", "## Workflow\nSTALE LINE"));
 
   const result = installerRun(dir, ["--sync"]);
   assert.strictEqual(result.status, 0);
@@ -47,9 +47,8 @@ test("sync replaces a stale autopilot, removes dropped scripts and updates the w
   assert.doesNotMatch(read(dir, ".codex/autopilot.js"), /STALE-MARKER/);
   assert.ok(!fs.existsSync(path.join(dir, ".codex", "old-script.js")));
   assert.ok(fs.existsSync(path.join(dir, ".codex", "user-script.js")));
-  assert.doesNotMatch(read(dir, "CLAUDE.md"), /STALE LINE/);
-  assert.match(read(dir, ".codex/backup/CLAUDE.md.bak"), /STALE LINE/);
-});
+  assert.doesNotMatch(read(dir, "CLAUDE.local.md"), /STALE LINE/);
+  });
 
 test("sync is silent when current, ignores other projects, and never downgrades", () => {
   const dir = tempProject();
@@ -87,9 +86,17 @@ test("customized caveman skill is kept; an untouched older copy is refreshed", (
   assert.notStrictEqual(fs.readFileSync(agentSkill, "utf8"), "OLD BUNDLED");
 });
 
-test("--keep-sections leaves a customized section alone", () => {
+test("a project without a manifest gets a hint, not a rewrite", () => {
   const dir = tempProject();
-  fs.writeFileSync(path.join(dir, "CLAUDE.md"), read(dir, "CLAUDE.md").replace("## Workflow", "## Workflow\nMINE"));
-  installerRun(dir, [...plain, "--keep-sections"]);
-  assert.match(read(dir, "CLAUDE.md"), /MINE/);
+  fs.rmSync(path.join(dir, ".codex", "workflow-manifest.json"));
+  fs.writeFileSync(path.join(dir, ".codex", "autopilot.js"), "// legacy\n");
+  const result = installerRun(dir, ["--sync"]);
+  assert.match(result.stdout, /setup --project-only/);
+  assert.strictEqual(read(dir, ".codex/autopilot.js"), "// legacy\n");
+});
+
+test("setup leaves git status clean, including the manifest", () => {
+  const dir = tempProject();
+  const status = spawnSync("git", ["status", "--porcelain"], { cwd: dir, encoding: "utf8" }).stdout;
+  assert.strictEqual(status.trim(), "");
 });

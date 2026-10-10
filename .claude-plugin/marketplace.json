@@ -1,6 +1,6 @@
 {
   "name": "claude-codex-workflow",
-  "description": "Claude plans or implements, Codex implements, and a background Claude run checks and fixes Codex's work. Playwright, graphify and caveman are wired in for both agents; Impeccable design skills are optional.",
+  "description": "Claude plans or implements; for Codex-implemented plans Claude hands off automatically and reviews the result, with parallel background checks, alignment review and a Playwright UI audit. Local only, no merge conflicts. graphify and caveman for both agents; Impeccable design skills are optional.",
   "owner": {
     "name": "Jonrei",
     "url": "https://github.com/Jonrei1"
@@ -9,7 +9,7 @@
     {
       "name": "claude-codex-workflow",
       "source": "./",
-      "description": "Set up the Claude + Codex workflow in any project with one command (/claude-codex-workflow:setup installs Claude Code, Codex CLI, Playwright and graphify; Impeccable is optional and asked about). Claude plans; one pasted line has Codex run every phase with background Claude verification."
+      "description": "Set up the Claude + Codex workflow in any project with one command (/claude-codex-workflow:setup installs Claude Code, Codex CLI, Playwright and graphify; Impeccable is optional and asked about). Local-only: no tracked file changes. Claude asks implement-or-orchestrate on every plan, checks it against criteria, sends it to Codex itself, and reviews the result automatically with parallel checks, alignment review and a Playwright UI audit."
     }
   ]
 }

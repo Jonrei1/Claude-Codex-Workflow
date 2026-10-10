@@ -1,104 +1,124 @@
 ## Workflow
 
+Claude + Codex workflow. Everything it writes is local to this clone and hidden through
+`.git/info/exclude`: plans in `.codex/plans/`, verify logs in `.codex/verify/<task>/`, task
+summaries in `.codex/tasks/`, and these rules in `CLAUDE.local.md`. Never move them into tracked
+files and never add them to `.gitignore`: teammates must not see workflow changes.
+
 - **No agent commits:** Claude, Codex, `.codex/autopilot.js` and the headless verify runs
   never run `git commit`, `git add`, `git stash` or `git push`. Every change stays in the
   working tree, and the user reviews and commits it by hand. Progress is tracked with
   snapshots (git tree objects, which aren't commits and aren't on any branch).
-- **Ask first:** Before changing any app code for a new task, Claude asks the user
-  (with AskUserQuestion) which role to take. It asks no matter how small the change
-  looks, and the answer holds for the rest of that task.
-  - **Implement directly:** Claude edits the code itself, runs the checks below, and
-    fixes failures.
-  - **Orchestrator (planner):** Claude doesn't edit app code. It writes a phased plan
-    to `plans/<short-task-name>.md` (see **Plans** below). In plan mode, Claude saves
-    the approved plan to `plans/`, because the plan-mode file lives outside the repo
-    and Codex can't see it. Then it hands off with **one paste** (the default).
-  - **One-paste handoff (default):** once the user approves the plan (ExitPlanMode
-    approval, or an explicit "go"), Claude saves it to `plans/<slug>.md`, runs
-    `node .codex/autopilot.js check plans/<slug>.md`, and fixes the plan until it's
-    runnable. Claude **always** ends that reply with the paste line for Codex, alone in
-    a code block so it's one click to copy:
-
-    ```
-    Execute plans/<slug>.md
-    ```
-
-    Claude doesn't start autopilot or Codex itself. Pasted into Codex, that line runs
-    the whole task (AGENTS.md "Full plan execution"): the optional plan review, every
-    phase (Codex implements, `autopilot.js verify` runs the gate and the Claude
-    verification, Codex reworks up to 2 times), and the task summary. Progress is in
-    `.codex/autopilot/status.json`. If the user brings back a `stuck` or `failed` run,
-    Claude explains the reason, fixes the plan if needed, and ends with the same paste
-    line. When it's done, the user reviews and commits the changes.
-  - **Manual handoff:** if the user says "manual", Claude ends its reply with
-    `Execute phase 1 of plans/<slug>.md` instead, and the user hands it off one phase at
-    a time.
-
-  Claude doesn't ask when the task only reads code, answers questions, or edits docs
-  and config (`*.md`, `plans/`, `.claude/`, `.codex/`), or in the headless verify run
-  below, which can't ask.
-- **Plans:** Orchestrator plans follow `plans/_template.md`.
-  - Phases are small enough to review as one diff. Prefer 3 to 6 phases.
-  - Every phase has a gate: a runnable command, not a description.
-  - A phase may suggest a commit message for the user (`**Suggested commit:**`).
+- **Ask on every plan:** at the start of every new plan or task that changes app code, Claude
+  asks the user (with AskUserQuestion) who implements it, even when the change looks small:
+  **Codex implements (Claude orchestrates)** (recommended for multi-file work),
+  **Claude implements**, or **Codex, manual phases**. The answer holds for that plan only;
+  ask again for the next one. Don't ask for read-only questions or for edits to docs and
+  config only (`*.md`, `.codex/`, `.claude/`).
+  - **Claude implements:** Claude edits the code itself, runs the project's checks, and fixes
+    failures. For UI changes it also runs the UI audit below itself.
+  - **Codex implements:** Claude doesn't edit app code. It writes a phased plan (see
+    **Plans**), and once the user approves it (ExitPlanMode approval or an explicit "go"):
+    1. Save it to `.codex/plans/<slug>.md`. The plan-mode file lives outside the repo, and
+       Codex can't see it.
+    2. Run `node .codex/autopilot.js check .codex/plans/<slug>.md` and fix the plan until
+       every checklist item passes.
+    3. Run `node .codex/autopilot.js handoff .codex/plans/<slug>.md` with a Bash `timeout`
+       of at least 150000. It asks the Codex app-server which Codex session is open in this
+       repo (an IDE terminal counts, even before its first message) and posts the plan into it
+       (`codex queue`). If none is open it waits up to 90 s for one. Tell the user which
+       session it used (the "Sent to Codex session ..." line). Never open a new terminal
+       yourself. Exit 5 means it couldn't reach Codex: show the printed line in its own code
+       block for the user to paste.
+    4. Start `node .codex/autopilot.js wait .codex/plans/<slug>.md` with Bash
+       `run_in_background: true`, tell the user Codex is running and you're watching, and
+       stop. Don't start Codex or `autopilot.js run` yourself. `wait` ends on its own when the
+       run is done or stuck, including when Codex stops without finishing. If it prints
+       "Codex is waiting for your approval/input", the user needs to answer in the Codex panel.
+  - **Codex, manual phases:** the same, but hand off with `--phase 1` and the user drives
+    later phases (`handoff ... --phase <N>`). The Codex Stop hook verifies each phase.
+- **Review when Codex finishes:** when `wait` exits, Claude reviews without being asked.
+  - **done (exit 0):** read the summary it printed, `.codex/verify/<slug>/` (per-phase
+    `*.alignment.md`, `*.checks.log`, `*.ui-audit.md`), and spot-check the diff
+    (`git diff`, `git status`). If the plan has `ui: yes`, run the **final UI audit** below.
+    Then report: what shipped, per-phase verdicts, UI audit result, anything to look at
+    before committing. If the summary lists failures that were already there before the task
+    (the baseline), say they weren't caused by this task and offer a separate plan to fix
+    them. If there are real problems, propose a rework plan and ask before handing it off.
+  - **stuck (4) or failed (1):** this covers Codex running `stop`, a gate failing 3 times,
+    too many reworks, and `wait` noticing that Codex's turn ended or its session closed
+    mid-run ("Codex stopped without finishing"). Explain the reason, quoting "Codex's last
+    message" when it's printed. Then say what unblocks it:
+    - **Environment** (a missing dependency, a tool, credentials, a pre-existing error that
+      still blocks): tell the user the exact fix (for example `npm i exceljs`).
+    - **Plan** (wrong scope, a gate that can't pass): fix the plan.
+    Ask the user before sending `node .codex/autopilot.js handoff .codex/plans/<slug>.md --continue`
+    and waiting again. If the summary says the run was NOT STARTED, hand it off again without
+    `--continue`.
+  - **timed out (6):** say Codex never started or is still running; offer to wait again.
+  - Every outcome ends with a message to the user. Never end the turn with `wait` gone and
+    nothing reported.
+- **Plans:** Orchestrator plans follow `.codex/plans/_template.md`. `check` enforces:
+  - frontmatter `task` (the file name), `risk`, `review`, `ui: yes|no`;
+  - `## Acceptance` items with ids (`- A1: ...`), each covered by some phase's `**Covers:**`;
+  - every phase has **Scope**, **Steps**, **Covers**, **Done when**, a **Gate** with runnable
+    commands (npm scripts must exist, programs must be on PATH), and every phase except the
+    last has **Hands off**: what the next phase relies on (files, exports, API shapes, data).
+    Write Hands off so the next phase can start without guessing;
+  - with `ui: yes`: a `## UI audit` section (start command, URL, viewports, checks), and a
+    `**UI audit:**` block on each phase that changes what the user sees.
+  - Prefer 3 to 6 phases, each small enough to review as one diff. A phase may suggest a
+    commit message for the user (`**Suggested commit:**`).
   - Backend phases list expected files and dependents from `graphify query`.
-  - UI phases name the Impeccable command to run (only if Impeccable is installed), and
-    the Playwright spec if the project has one.
-  - Requested browser acceptance steps name the app startup command, URL, interactions,
-    viewport sizes and expected results. Playwright MCP is available after machine
-    setup; it does not create project test specs. Use executable tests for phase gates.
-  - Set `risk: high` in the frontmatter for schema, auth, payments, or cross-layer
-    contract changes. It switches the alignment review to Opus.
-  - Phases apply to orchestrator plans only. Implement-directly tasks don't use them.
-  - **Optional Codex review:** set `review: codex` for a second opinion before any code
-    is written. It's on by default for `risk: high`, and skipped for small, low-risk
-    tasks. The one-paste run does it first and has Claude triage the findings. In a manual handoff,
-    Claude saves a copy as `plans/.<slug>.orig.md`, then ends its reply with
-    `Review plans/<slug>.md` (to paste into a fresh Codex session) instead of the
-    execute line. Codex appends `## Codex Findings`, and the user accepts or rejects them.
-- **Verify:** Runs automatically. When the working tree changed since the last verified
-  snapshot, Codex's Stop hook (`.codex/hooks/claude-verify.js`) starts two headless
-  Claude runs in the background. In a one-paste run, `autopilot.js verify` calls the same
-  script after each phase instead, and the Stop hook stays quiet. The
-  change under review is written to `.codex/verify/phase.diff`.
-  - **Step A, checks:** the script runs the project's checks (auto-detected, or `checks`
-    in `.codex/verify.json`) itself. Only if one fails, Claude (Sonnet, low effort) fixes
-    lint, formatting and type errors and reports other failures, then the checks re-run.
-    Report: `.codex/verify/last.log`.
-  - **Step B, alignment** (Sonnet, medium effort, or Opus when the plan has `risk: high`
-    or the diff touches `alignment.riskPaths` in `.codex/verify.json`): report-only, with no
-    write tools. It lists DONE / PARTIAL / MISSING / OUT OF SCOPE / GATE / RISKS for
-    the phase and ends with `VERDICT: PASS | NEEDS REWORK`. Report:
-    `.codex/verify/alignment.md`.
-  - The verified snapshot only advances on PASS. When the user commits, HEAD becomes
-    the new starting point.
-- **Fix:** In an interactive session, Claude fixes type, lint and build failures
-  directly instead of sending them back to Codex, and re-runs the checks until they
-  pass. Behavior failures and NEEDS REWORK findings go back into the plan as rework
-  for Codex.
-- **Design:** Impeccable is optional. It is installed when `/impeccable` is available or
-  the project has `.impeccable/`. If it is installed, Claude uses it for UI work
-  (`/impeccable <command>`); `PRODUCT.md` and `DESIGN.md` are the design context, and as
-  orchestrator Claude's UI plans name the impeccable command Codex should run and the
-  DESIGN.md sections to follow. If it isn't installed, follow the project's existing
-  design conventions and don't mention impeccable commands in plans. Either way, never
-  commit impeccable's live-mode block (`impeccable-live-start` …
+  - Set `risk: high` for schema, auth, payments, or cross-layer contract changes. It switches
+    the alignment review to Opus and turns on the Codex plan review.
+  - **Optional Codex review:** `review: codex` has Codex review the plan before any code is
+    written; Claude triages the findings in the same run.
+- **Verify (automatic):** after each phase, `autopilot.js verify` (or, in manual phases, the
+  Codex Stop hook) runs three steps in parallel in the background:
+  - **Step A, checks:** the project's checks (auto-detected, or `checks` in
+    `.codex/verify.json`), concurrently. Only if one fails, Claude (Sonnet, low effort) fixes
+    lint, formatting and type errors, then the checks re-run.
+  - **Step B, alignment** (Sonnet, medium; Opus for `risk: high` or `alignment.riskPaths`):
+    report-only review of the phase against Done when, Covers and Hands off.
+  - **Step C, UI audit** (only for phases with a **UI audit** block, or `ui: yes` changes to
+    `ui.paths`): a headless Claude run with Playwright opens the app at each viewport,
+    report-only. It starts the app with the plan's start command if it isn't running.
+  - PASS needs alignment PASS, passing checks, and a UI audit that isn't NEEDS REWORK
+    (BLOCKED, for example the app didn't start, is reported but doesn't fail the phase).
+    Reports: `.codex/verify/<slug>/phase-<N>.*`; the latest are also in
+    `.codex/verify/alignment.md` and `last.log`.
+- **Final UI audit (Claude, Playwright MCP):** for `ui: yes` plans, after Codex is done.
+  Start the app with the plan's `- Start:` command if nothing answers at the URL (in the
+  background), then for each viewport: resize, navigate, snapshot, do the interactions, and
+  screenshot each state. Check every `## UI audit` item, plus layout breaks, overflow,
+  console errors, failed requests and unlabeled controls. Write
+  `.codex/verify/<slug>/final-ui-audit.md` (PASS/FAIL per item, screenshots, then
+  `UI AUDIT: PASS | NEEDS REWORK`), and stop the app if you started it. Manual testing and
+  any login state the app needs stay with the user.
+- **Fix:** in an interactive session, Claude fixes type, lint and build failures directly
+  instead of sending them back to Codex. Behavior failures and NEEDS REWORK findings go into
+  a rework plan for Codex.
+- **graphify:** use `graphify query`, `path` and `explain` before reading many raw files.
+  After all code edits for a task are complete, run `graphify update .` once at the end of
+  the coding session. Do not run it between file edits.
+- **Design:** Impeccable is optional. If `/impeccable` is available or the project has
+  `.impeccable/`, use it for UI work; `PRODUCT.md` and `DESIGN.md` are the design context, and
+  UI plans name the impeccable command Codex should run and the DESIGN.md sections to follow.
+  Otherwise follow the project's existing design conventions and don't mention impeccable
+  commands in plans. Never commit impeccable's live-mode block (`impeccable-live-start` …
   `impeccable-live-end` in the root layout).
-
-Use Playwright MCP for browser acceptance checks requested by the user or approved
-plan. Start the app first and record the results. Headless verification does not use
-MCP browser tools; Step A can run configured browser test commands. Manual testing
-and providing any authenticated browser state stay with the user.
 
 ### Closing a task
 
-A one-paste run closes the task itself (`autopilot.js close`). In a manual handoff, when the user says "close <task>":
-1. Read `plans/<task>.md`, `.codex/verify/alignment.md`, and the task's changes
-   (`git status` and `git diff`).
-2. Write `docs/tasks/<YYYY-MM-DD>-<task>.md` from the template below. 25 lines max.
-3. Fill "Deviations from the plan" by comparing the plan with the actual diff, not
-   from memory.
-4. Don't edit app code, and don't commit. The user commits the summary with the work.
+An automatic run closes the task itself (`autopilot.js close`). In manual phases, when the
+user says "close <task>":
+1. Read `.codex/plans/<task>.md`, the reports in `.codex/verify/<task>/`, and the task's
+   changes (`git status` and `git diff`).
+2. Write `.codex/tasks/<YYYY-MM-DD>-<task>.md` from the template below. 25 lines max.
+3. Fill "Deviations from the plan" by comparing the plan with the actual diff, not from
+   memory.
+4. Don't edit app code, and don't commit.
 
 ```md
 # <Task title>
@@ -107,6 +127,7 @@ A one-paste run closes the task itself (`autopilot.js close`). In a manual hando
 - Risk: normal | high
 - Plan reviewed by Codex: yes | no
 - Final verdict: PASS | PASS WITH NOTES
+- UI audit: PASS | NEEDS REWORK | not run
 
 ## What shipped
 - Phase 1: <title> (<main files changed>)
@@ -115,7 +136,7 @@ A one-paste run closes the task itself (`autopilot.js close`). In a manual hando
 - <what changed and why, or "none">
 
 ## Review findings that mattered
-- <Codex plan findings or alignment issues that changed the work, or "none">
+- <Codex plan findings, alignment or UI audit issues that changed the work, or "none">
 
 ## Follow-ups
 - <deferred work, known gaps, or "none">

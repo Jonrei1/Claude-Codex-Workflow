@@ -22,6 +22,8 @@ function fixture(options = {}) {
   const registered = new Set(options.registered || []);
   const env = {
     dryRun: Boolean(options.dryRun),
+    // Most tests cover both clients (--playwright-codex); the default is Claude only.
+    codex: "codex" in options ? options.codex : true,
     has: (command) => !(options.missingClients || []).includes(command),
     exists: (file) => file === installation.browser && browserReady,
     resolve: () => {
@@ -55,6 +57,15 @@ function fixture(options = {}) {
   };
   return { env, calls, records, prompts, installation };
 }
+
+test("by default only Claude gets Playwright, since Claude does the UI audits", async () => {
+  const f = fixture({ codex: undefined });
+  await setupPlaywright(f.env);
+  const writes = f.calls.filter((call) => call.args[0] !== "root" && call.args[1] !== "get");
+  assert.deepEqual(writes.map((call) => call.command), ["npm", process.execPath, "claude"]);
+  assert.ok(!f.calls.some((call) => call.command === "codex"));
+  assert.ok(f.records.every((record) => record.ok === true));
+});
 
 test("first setup installs the server and matching browser, then connects both clients", async () => {
   const f = fixture();

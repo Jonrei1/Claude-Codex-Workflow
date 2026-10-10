@@ -1,7 +1,7 @@
 {
   "name": "claude-codex-workflow",
-  "version": "1.5.0",
-  "description": "Set up the Claude + Codex workflow in any project with one command (/claude-codex-workflow:setup installs Claude Code, Codex CLI, Playwright and graphify; Impeccable is optional and asked about). Claude plans; one pasted line has Codex run every phase with background Claude verification.",
+  "version": "2.3.0",
+  "description": "Set up the Claude + Codex workflow in any project with one command (/claude-codex-workflow:setup installs Claude Code, Codex CLI, Playwright and graphify; Impeccable is optional and asked about). Local-only: no tracked file changes. Claude asks implement-or-orchestrate on every plan, checks it against criteria, sends it to Codex itself, and reviews the result automatically with parallel checks, alignment review and a Playwright UI audit.",
   "author": {
     "name": "Jonrei",
     "url": "https://github.com/Jonrei1"
