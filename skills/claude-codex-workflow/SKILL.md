@@ -30,7 +30,7 @@ A reusable setup for any project, new or existing, on any stack, on Windows, mac
 ## When invoked
 
 1. Check whether the project is new (no app code yet) or existing, and that it's a git repo (`git init` if not, after asking).
-2. Run the installer from the project root: `node <this skill's folder>/scripts/install.js`. The installer can't prompt from a Claude session, so if it reports missing tools, show the install commands and ask before re-running with `--yes`. Impeccable is optional: ask the user whether to install it before running the installer, then pass `--impeccable` or `--skip-impeccable`. If graphify isn't installed (`graphify --version` fails), also ask whether to install it for the user only (recommended) or globally (system-wide pip, usually needs admin rights), then pass `--graphify-scope=user` or `--graphify-scope=global`. `--yes` doesn't install it. Use `--impeccable-providers=codex` (which implies `--impeccable`) when the Impeccable plugin is already enabled in Claude Code. If a workflow section already exists but differs, offer `--update-sections`.
+2. Run the installer from the project root: `node <this skill's folder>/scripts/install.js`. The installer can't prompt from a Claude session, so if it reports missing tools, show the install commands and ask before re-running with `--yes`. Impeccable is optional: ask the user whether to install it before running the installer, then pass `--impeccable` or `--skip-impeccable`. If graphify isn't installed (`graphify --version` fails), also ask whether to install it for the user only (recommended) or globally (system-wide pip, usually needs admin rights), then pass `--graphify-scope=user` or `--graphify-scope=global`. `--yes` doesn't install it. Use `--impeccable-providers=codex` (which implies `--impeccable`) when the Impeccable plugin is already enabled in Claude Code. Existing workflow sections are replaced with the plugin's (old copy saved in `.codex/backup/`); offer `--keep-sections` if the user customized them.
 3. Show the summary, and fix by hand anything it couldn't merge (for example a `hooks.json` that isn't valid JSON). See [What the installer does](#what-the-installer-does).
 4. Read the checks it printed (`--print-checks`). If the list is wrong or empty, propose a `.codex/verify.json`. Also propose `alignment.riskPaths` for the project's schema, migration and auth paths (see [Checks](#checks)).
 5. List the steps left for the user (trusting the hooks in Codex, letting Codex's verify commands use the network), then the new- or existing-project steps from [Setup](#setup).
@@ -117,7 +117,7 @@ npx github:Jonrei1/Claude-Codex-Workflow                       # anywhere, no pl
 node <skill folder>/scripts/install.js                         # from a copy of this skill
 ```
 
-Flags: `--yes` (approve missing global tools and Playwright setup), `--dry-run`, `--tools-only`, `--project-only`, `--update-sections`, `--impeccable`, `--impeccable-providers=codex`, `--graphify-scope=user|global`, `--skip-graphify`, `--skip-impeccable`, `--skip-playwright`, `--root <dir>`. Re-running keeps existing Playwright registrations and upgrades the `.codex/` scripts to the plugin's version. `--project-only` skips global tools, Chromium and MCP registration.
+Flags: `--yes` (approve missing global tools and Playwright setup), `--dry-run`, `--tools-only`, `--project-only`, `--keep-sections`, `--sync`, `--impeccable`, `--impeccable-providers=codex`, `--graphify-scope=user|global`, `--skip-graphify`, `--skip-impeccable`, `--skip-playwright`, `--root <dir>`. Re-running keeps existing Playwright registrations and upgrades the `.codex/` scripts and the workflow sections to the plugin's version, removing scripts that earlier versions installed and this one dropped (`.codex/workflow-manifest.json` records what it installed). After a plugin update, the plugin's SessionStart hook runs `install.js --sync` in projects that already use the workflow, so no re-run is needed. `--project-only` skips global tools, Chromium and MCP registration.
 
 ### What the installer does
 
@@ -134,9 +134,9 @@ Flags: `--yes` (approve missing global tools and Playwright setup), `--dry-run`,
 
 **Project.** It never overwrites `CLAUDE.md`, `AGENTS.md` or `.codex/hooks.json`; it merges into them.
 
-1. Copies `.codex/hooks/claude-verify.js`, `.codex/hooks/workflow-lib.js` and `.codex/autopilot.js` (always the plugin's version).
-2. Creates `plans/_template.md`, the caveman skill in `.claude/skills/caveman/` and `.agents/skills/caveman/`, and `docs/tasks/.gitkeep`, if they're missing.
-3. Appends the `## Workflow` section to `CLAUDE.md` and the `## Codex execution` section to `AGENTS.md`. If a section exists and differs, it says so; `--update-sections` replaces it.
+1. Copies `.codex/hooks/claude-verify.js`, `.codex/hooks/workflow-lib.js` and `.codex/autopilot.js` (always the plugin's version), deletes any script the previous manifest listed that this version no longer ships, and writes `.codex/workflow-manifest.json`.
+2. Creates `plans/_template.md`, the caveman skill in `.claude/skills/caveman/` and `.agents/skills/caveman/`, and `docs/tasks/.gitkeep`, if they're missing. The template and caveman files are refreshed on later runs only while they still match what the installer wrote.
+3. Appends the `## Workflow` section to `CLAUDE.md` and the `## Codex execution` section to `AGENTS.md`. If a section exists and differs, it replaces it with the plugin's (the old file is saved to `.codex/backup/`); `--keep-sections` leaves it.
 4. Adds the verify and graphify hooks to `.codex/hooks.json`, keeping every existing entry.
 5. Adds `.codex/verify/`, `.codex/autopilot/`, `graphify-out/`, `plans/*` and `!plans/_template.md` to `.gitignore`. Plans are local handoffs, not history; `plans/*` (not `plans/`) lets the template be re-included.
 6. Runs `graphify claude install` and `graphify codex install`, then makes sure both files end with the once-per-task graphify rule.
@@ -174,7 +174,7 @@ Per-OS notes:
 2. Build the graph with `/graphify .` in Claude Code.
 3. Run `/impeccable init` to write `PRODUCT.md`, then `/impeccable document` to capture the current design system in `DESIGN.md`. If the project already had an older Impeccable setup, run `/impeccable doctor` instead to bring it up to date.
 4. If the repo already has UI conventions in another file, merge them into `DESIGN.md`, or point `CLAUDE.md` and `AGENTS.md` at that file.
-5. Upgrading from an earlier version of this workflow: re-run the installer with `--update-sections` so `CLAUDE.md` and `AGENTS.md` get the one-paste handoff.
+5. Upgrading from an earlier version of this workflow: update the plugin (the SessionStart hook syncs the project) or re-run the installer; both refresh the scripts and the `CLAUDE.md` / `AGENTS.md` sections.
 
 ## Checks
 
@@ -247,7 +247,7 @@ Also create an empty `docs/tasks/` folder (with a `.gitkeep`) for the task summa
 ## Troubleshooting
 
 - **The installer says a tool is missing but doesn't install it:** It only installs global tools after asking in a terminal, or with `--yes`. From Claude, re-run with `--yes`.
-- **The installer says a section "exists and differs":** The project has an older `## Workflow` or `## Codex execution` section. Re-run with `--update-sections` to replace just that section.
+- **The project still follows an old workflow:** Update the plugin and start a new session (the SessionStart hook runs `install.js --sync`), or run `/claude-codex-workflow:setup --project-only`. It replaces the scripts and sections and deletes stale ones. Then restart Codex. Your previous `CLAUDE.md` / `AGENTS.md` is in `.codex/backup/`. If a run printed "sync skipped", or the project's manifest shows a newer version than the plugin, update the plugin.
 - **`verify` fails inside Codex with `Failed to start claude` or a network error:** The Codex sandbox blocked the headless Claude run. Approve running the command outside the sandbox, and make sure `claude` is on the PATH Codex sees.
 - **Codex's `verify` command gets cut off:** Its shell timeout is shorter than the Claude run. Ask Codex to run it with a 30-minute timeout; it's safe to run `verify` again for the same phase.
 - **`begin` says another run is still marked running:** `.codex/autopilot/status.json` is left over from a run that never finished. If no run is going, pass `--force`.

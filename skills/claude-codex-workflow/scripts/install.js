@@ -17,14 +17,22 @@
 //    installed only with --impeccable, or when you answer yes to the prompt.
 //
 // It never overwrites CLAUDE.md, AGENTS.md or hooks.json; it merges into them. The scripts
-// under .codex/ belong to the workflow and are updated on every run, so re-running the
-// installer upgrades a project. It never commits.
+// under .codex/ and the ## Workflow / ## Codex execution sections belong to the workflow and
+// are updated on every run, so re-running the installer upgrades a project. Files an earlier
+// version installed and this one no longer ships are removed (tracked in
+// .codex/workflow-manifest.json). It never commits.
+//
+// The plugin also runs `install.js --sync` from a SessionStart hook, so a plugin update
+// reaches every project that already uses the workflow without re-running setup.
 //
 // Flags:
 //   --yes                       approve missing global tools and Playwright setup (not Impeccable)
 //   --tools-only | --project-only
 //   --dry-run                   print what would happen, change nothing
-//   --update-sections           replace existing ## Workflow / ## Codex execution sections
+//   --keep-sections             leave existing ## Workflow / ## Codex execution sections alone
+//                               (they are replaced by default; --update-sections is the same as the default)
+//   --sync                      quiet, files-only upgrade of an already-set-up project (used by the
+//                               plugin's SessionStart hook): no tools, prompts, graphify or Impeccable
 //   --impeccable                install Impeccable (otherwise asked on a terminal, skipped elsewhere)
 //   --impeccable-providers=<l>  implies --impeccable; default claude,codex (use codex if you have the Impeccable plugin)
 //   --skip-impeccable           don't install Impeccable and don't ask
@@ -50,11 +58,38 @@ const flagValue = (name) => {
 
 const isWindows = process.platform === "win32";
 const dryRun = flag("--dry-run");
+const sync = flag("--sync");
 const templates = path.join(__dirname, "..", "templates");
+const pluginVersion = readJson(path.join(__dirname, "..", "..", "..", "package.json"))?.version || "0.0.0";
+const MANIFEST = path.join(".codex", "workflow-manifest.json");
+// Scripts the workflow owns: always the plugin's version, and removed once a later version drops them.
+const OWNED = ["codex/hooks/claude-verify.js", "codex/hooks/workflow-lib.js", "codex/autopilot.js"];
+// Files the user may customize, created when missing and refreshed only while still unmodified.
+const MANAGED = [
+  ["plans/_template.md", "plans/_template.md"],
+  ["skills/caveman/SKILL.md", ".claude/skills/caveman/SKILL.md"],
+  ["skills/caveman/SKILL.md", ".agents/skills/caveman/SKILL.md"],
+];
 const results = [];
+const changed = [];
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function compareVersions(a, b) {
+  const [x, y] = [a, b].map((v) => String(v).split(".").map((n) => parseInt(n, 10) || 0));
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+  return 0;
+}
 
 function record(step, ok, note = "") {
   results.push({ step, ok, note });
+  if (sync) return;
   const mark = ok === true ? "ok  " : ok === false ? "FAIL" : "--  ";
   console.log(`  [${mark}] ${step}${note ? `: ${note}` : ""}`);
 }
@@ -210,10 +245,31 @@ async function installTools(impeccable) {
 
 function write(file, content, step, note) {
   if (dryRun) return record(step, null, `dry run, not written (${note})`);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, content);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // Write beside the target and rename, so a reader never sees a half-written script.
+    const temp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, content);
+    fs.renameSync(temp, file);
+  } catch (error) {
+    return record(step, false, `couldn't write: ${error.message}`);
+  }
+  changed.push(step);
   record(step, true, note);
 }
+
+function remove(file, step, note) {
+  if (dryRun) return record(step, null, `dry run, not removed (${note})`);
+  try {
+    fs.rmSync(file, { force: true });
+  } catch (error) {
+    return record(step, false, `couldn't remove: ${error.message}`);
+  }
+  changed.push(`${step} (removed)`);
+  record(step, true, note);
+}
+
+const sha = (text) => require("node:crypto").createHash("sha256").update(text).digest("hex");
 
 function readText(file) {
   try {
@@ -231,10 +287,16 @@ function copyOwned(root, from, to) {
   write(path.join(root, to), source, to, current === null ? "created" : "updated to the plugin's version");
 }
 
-// Files the user may customize: only created when missing.
-function copyIfMissing(root, from, to) {
-  if (readText(path.join(root, to)) !== null) return record(to, true, "exists, kept");
-  write(path.join(root, to), fs.readFileSync(path.join(templates, from), "utf8"), to, "created");
+// Files the user may customize: created when missing, and refreshed to the plugin's version
+// only while they still match what an earlier run installed (the manifest holds its hash).
+// Edited files are kept.
+function copyManaged(root, from, to, previous) {
+  const source = fs.readFileSync(path.join(templates, from), "utf8");
+  const current = readText(path.join(root, to));
+  if (current === null) return write(path.join(root, to), source, to, "created");
+  if (current === source) return record(to, true, "up to date");
+  if (previous[to] && previous[to] === sha(current)) return write(path.join(root, to), source, to, "updated to the plugin's version");
+  record(to, true, "customized, kept");
 }
 
 function sectionRange(text, heading) {
@@ -251,7 +313,8 @@ function sectionRange(text, heading) {
   return { start: match.index, end: text.length };
 }
 
-// Appends the template's section, or replaces it with --update-sections.
+// Appends the template's section, or replaces it when it differs. --keep-sections leaves it alone.
+// The replaced text is saved to .codex/backup/ first, in case it held your own edits.
 function mergeSection(root, file, section, heading) {
   const target = path.join(root, file);
   const text = readText(target);
@@ -260,50 +323,67 @@ function mergeSection(root, file, section, heading) {
   const range = sectionRange(text, heading);
   if (!range) return write(target, `${text.trimEnd()}\n\n${body}`, file, `appended the ${heading} section`);
   if (text.slice(range.start, range.end).trim() === section.trim()) return record(file, true, `${heading} is up to date`);
-  if (!flag("--update-sections")) {
-    return record(file, true, `${heading} exists and differs from the plugin's; re-run with --update-sections to replace it`);
+  if (flag("--keep-sections")) {
+    return record(file, true, `${heading} exists and differs from the plugin's; kept (--keep-sections)`);
   }
+  write(path.join(root, ".codex", "backup", `${file}.bak`), text, `.codex/backup/${file}.bak`, `previous ${file} saved`);
   const updated = `${text.slice(0, range.start)}${body}${range.end < text.length ? "\n" : ""}${text.slice(range.end)}`;
-  write(target, updated, file, `replaced the ${heading} section`);
+  write(target, updated, file, `replaced the ${heading} section with the plugin's`);
 }
 
 function hookCommands(group) {
   return (group.hooks || []).map((hook) => hook.command);
 }
 
-// Adds each template hook group whose command isn't in .codex/hooks.json yet.
-function mergeHooks(root, graphify, label) {
+// graphify may be installed at a full path; compare hook commands without it.
+const normalizeCommand = (command) => String(command).replace(/^"?[^"]*?graphify(\.exe)?"? hook-guard/i, "graphify hook-guard");
+
+// Adds each template hook group whose command isn't in .codex/hooks.json yet, and drops groups
+// an earlier version added that this version no longer ships. Returns the template's commands.
+function mergeHooks(root, graphify, label, previousHooks = []) {
   const file = path.join(root, ".codex", "hooks.json");
   let template = fs.readFileSync(path.join(templates, "codex", "hooks.json"), "utf8");
   if (graphify && graphify !== "graphify") template = template.replace(/"graphify hook-guard/g, `"${graphify} hook-guard`);
   const wanted = JSON.parse(template);
+  const wantedCommands = Object.values(wanted.hooks).flatMap((groups) => groups.flatMap(hookCommands));
   const text = readText(file);
   let config;
   try {
     config = text === null ? { description: wanted.description, hooks: {} } : JSON.parse(text);
   } catch {
-    return record(`.codex/hooks.json${label}`, false, "isn't valid JSON; merge templates/codex/hooks.json by hand");
+    record(`.codex/hooks.json${label}`, false, "isn't valid JSON; merge templates/codex/hooks.json by hand");
+    return wantedCommands;
   }
   config.hooks = config.hooks || {};
+  const stale = new Set(previousHooks.map(normalizeCommand));
+  for (const command of wantedCommands) stale.delete(normalizeCommand(command));
   let added = 0;
+  let dropped = 0;
   for (const [event, groups] of Object.entries(wanted.hooks)) {
-    const existing = (config.hooks[event] = config.hooks[event] || []);
-    const present = new Set(existing.flatMap(hookCommands));
+    let existing = (config.hooks[event] = config.hooks[event] || []);
+    const kept = existing.filter((group) => !(hookCommands(group).length && hookCommands(group).every((command) => stale.has(normalizeCommand(command)))));
+    dropped += existing.length - kept.length;
+    existing = config.hooks[event] = kept;
+    const present = new Set(existing.flatMap(hookCommands).map(normalizeCommand));
     for (const group of groups) {
-      if (hookCommands(group).every((command) => present.has(command))) continue;
+      if (hookCommands(group).every((command) => present.has(normalizeCommand(command)))) continue;
       existing.push(group);
       added++;
     }
   }
-  if (!added) return record(`.codex/hooks.json${label}`, true, "verify and graphify hooks present");
-  write(file, JSON.stringify(config, null, 2) + "\n", `.codex/hooks.json${label}`, `added ${added} hook group(s); trust them again in Codex (/hooks)`);
+  if (added || dropped) {
+    write(file, JSON.stringify(config, null, 2) + "\n", `.codex/hooks.json${label}`, `added ${added}, removed ${dropped} hook group(s); trust them again in Codex (/hooks)`);
+  } else {
+    record(`.codex/hooks.json${label}`, true, "verify and graphify hooks present");
+  }
+  return wantedCommands;
 }
 
 function updateGitignore(root) {
   const file = path.join(root, ".gitignore");
   const text = readText(file) || "";
   const lines = text.split(/\r?\n/).map((line) => line.trim());
-  const wanted = [".codex/verify/", ".codex/autopilot/", "graphify-out/", "plans/*", "!plans/_template.md"];
+  const wanted = [".codex/verify/", ".codex/autopilot/", ".codex/backup/", "graphify-out/", "plans/*", "!plans/_template.md"];
   const missing = wanted.filter((line) => !lines.includes(line));
   if (!missing.length) return record(".gitignore", true, "workflow entries present");
   const block = `${text && !text.endsWith("\n") ? "\n" : ""}${text ? "\n" : ""}# Claude + Codex workflow\n${missing.join("\n")}\n`;
@@ -327,24 +407,41 @@ function runStep(root, step, command, commandArgs) {
   record(step, result.status === 0, result.status === 0 ? "" : `\`${line}\` exited with ${result.status ?? "a timeout"}`);
 }
 
-function setupProject(root, graphify, impeccable) {
-  console.log(`\nProject: ${root}`);
-  for (const file of ["codex/hooks/claude-verify.js", "codex/hooks/workflow-lib.js", "codex/autopilot.js"]) {
-    copyOwned(root, file, `.${file}`);
+// Deletes files an earlier version installed that this one no longer ships.
+function removeStale(root, previous, current) {
+  for (const file of previous.files || []) {
+    if (current.includes(file) || path.isAbsolute(file) || file.split(/[\\/]/).includes("..")) continue;
+    const target = path.join(root, file);
+    if (readText(target) !== null) remove(target, file, "stale file from an earlier version removed");
   }
-  copyIfMissing(root, "plans/_template.md", "plans/_template.md");
-  copyIfMissing(root, "skills/caveman/SKILL.md", ".claude/skills/caveman/SKILL.md");
-  copyIfMissing(root, "skills/caveman/SKILL.md", ".agents/skills/caveman/SKILL.md");
+}
+
+function setupProject(root, graphify, impeccable) {
+  if (!sync) console.log(`\nProject: ${root}`);
+  const previous = readJson(path.join(root, MANIFEST)) || {};
+  const ownedPaths = OWNED.map((file) => `.${file}`);
+  for (const file of OWNED) copyOwned(root, file, `.${file}`);
+  removeStale(root, previous, ownedPaths);
+  const managed = {};
+  for (const [from, to] of MANAGED) {
+    copyManaged(root, from, to, previous.managed || {});
+    // Record a hash only for text this plugin wrote; a customized file keeps the old hash, so it never matches.
+    const text = readText(path.join(root, to));
+    if (text !== null && text === fs.readFileSync(path.join(templates, from), "utf8")) managed[to] = sha(text);
+    else if (previous.managed?.[to]) managed[to] = previous.managed[to];
+  }
   if (readText(path.join(root, "docs", "tasks", ".gitkeep")) === null) write(path.join(root, "docs", "tasks", ".gitkeep"), "", "docs/tasks/.gitkeep", "created");
 
   const claudeSection = fs.readFileSync(path.join(templates, "CLAUDE.workflow.md"), "utf8");
   const agentsSection = fs.readFileSync(path.join(templates, "AGENTS.codex.md"), "utf8").split("<!--")[0];
   mergeSection(root, "CLAUDE.md", claudeSection, "## Workflow");
   mergeSection(root, "AGENTS.md", agentsSection, "## Codex execution");
-  mergeHooks(root, graphify, "");
+  const hookCommandsInstalled = mergeHooks(root, graphify, "", previous.hooks);
   updateGitignore(root);
 
-  if (flag("--skip-graphify")) record("graphify install", null, "skipped (--skip-graphify)");
+  if (sync) {
+    // Files only: graphify and Impeccable are left as they are.
+  } else if (flag("--skip-graphify")) record("graphify install", null, "skipped (--skip-graphify)");
   else if (!graphify && !dryRun) record("graphify install", false, "graphify isn't installed; re-run after installing it");
   else {
     runStep(root, "graphify claude install", graphify || "graphify", ["claude", "install"]);
@@ -353,7 +450,9 @@ function setupProject(root, graphify, impeccable) {
     ensureGraphifyRule(root, "AGENTS.md");
   }
 
-  if (!impeccable) {
+  if (sync) {
+    // handled above
+  } else if (!impeccable) {
     record("impeccable install", null, flag("--skip-impeccable") ? "skipped (--skip-impeccable)" : "skipped (optional; re-run with --impeccable to add it)");
   } else {
     const providers = flagValue("--impeccable-providers") || "claude,codex";
@@ -362,7 +461,13 @@ function setupProject(root, graphify, impeccable) {
     mergeHooks(root, graphify, " (after Impeccable)");
   }
 
-  if (!dryRun) {
+  if (!dryRun && results.every((r) => r.ok !== false)) {
+    const manifest = { version: pluginVersion, files: ownedPaths, hooks: hookCommandsInstalled, managed };
+    const text = JSON.stringify(manifest, null, 2) + "\n";
+    if (readText(path.join(root, MANIFEST)) !== text) write(path.join(root, MANIFEST), text, MANIFEST, `workflow v${pluginVersion}`);
+  }
+
+  if (!dryRun && !sync) {
     console.log("\nDetected checks (node .codex/hooks/claude-verify.js --print-checks):");
     const checks = run(process.execPath, [path.join(root, ".codex", "hooks", "claude-verify.js"), "--print-checks"], { cwd: root });
     console.log((checks.stdout || checks.stderr || "").replace(/^/gm, "  "));
@@ -375,7 +480,36 @@ function projectRoot() {
   return result.status === 0 ? path.resolve(result.stdout.trim()) : "";
 }
 
+// Files-only upgrade for a project that already uses the workflow. Silent when there is
+// nothing to do, and never fails the session it runs in.
+function syncProject() {
+  const root = projectRoot();
+  if (!root) return;
+  const manifest = readJson(path.join(root, MANIFEST));
+  if (!manifest && readText(path.join(root, ".codex", "autopilot.js")) === null) return; // not a workflow project
+  // A teammate on a newer plugin already upgraded this project; don't take it back.
+  if (manifest?.version && compareVersions(manifest.version, pluginVersion) > 0) return;
+  setupProject(root, "", false);
+  const failed = results.filter((r) => r.ok === false);
+  const files = changed.filter((file) => file !== MANIFEST);
+  if (files.length) {
+    console.log(
+      `claude-codex-workflow v${pluginVersion}: synced ${files.length} project file(s) (${files.join(", ")}). ` +
+        "Restart Codex and re-read CLAUDE.md/AGENTS.md so the updated workflow applies.",
+    );
+  }
+  for (const r of failed) console.log(`claude-codex-workflow sync: ${r.step}: ${r.note}`);
+}
+
 async function main() {
+  if (sync) {
+    try {
+      syncProject();
+    } catch (error) {
+      console.log(`claude-codex-workflow sync skipped: ${error.message}`);
+    }
+    return;
+  }
   const doTools = !flag("--project-only");
   const doProject = !flag("--tools-only");
   if (dryRun) console.log("Dry run: nothing is installed or written.");

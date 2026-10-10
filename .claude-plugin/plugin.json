@@ -1,6 +1,6 @@
 {
   "name": "claude-codex-workflow",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Set up the Claude + Codex workflow in any project with one command (/claude-codex-workflow:setup installs Claude Code, Codex CLI, Playwright and graphify; Impeccable is optional and asked about). Claude plans; one pasted line has Codex run every phase with background Claude verification.",
   "author": {
     "name": "Jonrei",

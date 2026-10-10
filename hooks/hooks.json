@@ -1,0 +1,17 @@
+{
+  "description": "Keeps a project's workflow scripts and sections in step with the installed plugin version.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/skills/claude-codex-workflow/scripts/install.js\" --sync",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -90,7 +90,9 @@ The machine tools are shared across projects. Run full setup once on each develo
 | Project integrations | Runs graphify's agent installers. Only if you opt in, also runs `npx -y impeccable install --project --providers=claude,codex` | Project instructions; with Impeccable, design skills and hooks |
 | Ignores and checks | Adds workflow-state ignores and prints detected verification commands | `.gitignore` and installer output |
 
-Re-running updates workflow-owned `.codex/` scripts. Existing instruction sections are retained unless you pass `--update-sections`; existing customized plan and caveman templates are kept. Existing Playwright registrations are preserved and matching Chromium is reused. Keeping an existing registration does not prove it connects successfully; check `/mcp`.
+Re-running updates workflow-owned `.codex/` scripts, replaces the `## Workflow` and `## Codex execution` sections with the bundled versions (the old text is saved in `.codex/backup/`; pass `--keep-sections` to keep yours), and removes scripts an earlier version installed that the current one no longer ships (tracked in `.codex/workflow-manifest.json`). Plan and caveman templates are refreshed only while you haven't edited them.
+
+**Updating the plugin:** after `/plugin update claude-codex-workflow`, the plugin's SessionStart hook runs `install.js --sync` in any project that already uses the workflow. It upgrades the scripts, sections and hooks silently, removes stale files, and says so in the session. It does nothing in other projects, never downgrades a project a teammate already upgraded, and needs no re-run of setup. Restart Codex afterwards so it reloads `AGENTS.md` and the scripts. Existing Playwright registrations are preserved and matching Chromium is reused. Keeping an existing registration does not prove it connects successfully; check `/mcp`.
 
 ### Flags
 
@@ -106,7 +108,8 @@ Re-running updates workflow-owned `.codex/` scripts. Existing instruction sectio
 | `--impeccable` | Install Impeccable. Without it, a terminal installer asks; `--yes`, `--dry-run` and a non-interactive run skip it. |
 | `--skip-impeccable` | Don't install Impeccable and don't ask. |
 | `--impeccable-providers=codex` | Implies `--impeccable`; installs design skills only for Codex when Claude already uses the Impeccable plugin. |
-| `--update-sections` | Replace existing workflow sections in `CLAUDE.md` and `AGENTS.md` with bundled versions. |
+| `--keep-sections` | Leave existing workflow sections in `CLAUDE.md` and `AGENTS.md` alone. By default they are replaced with the bundled versions (the old text is saved under `.codex/backup/`). `--update-sections` is accepted and is the default. |
+| `--sync` | Quiet, files-only upgrade of a project that already uses the workflow. Run by the plugin's SessionStart hook; no tools, prompts, graphify or Impeccable. |
 | `--root <dir>` | Configure the Git repository containing that directory. |
 
 ### Finish initial setup
@@ -271,6 +274,7 @@ Verification reports are overwritten on the next run. Verification/helper state,
 ```text
 .claude-plugin/                     # plugin and marketplace manifests
 commands/setup.md                   # Claude Code setup command
+hooks/hooks.json                    # SessionStart hook that syncs projects after a plugin update
 package.json                        # npx installer entry point
 skills/claude-codex-workflow/
   SKILL.md                          # workflow guide and advanced operation

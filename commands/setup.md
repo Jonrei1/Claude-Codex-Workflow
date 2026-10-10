@@ -1,6 +1,6 @@
 ---
 description: Install the tools (Claude Code, Codex CLI, Playwright, graphify) and set up the Claude + Codex workflow in this project. Impeccable design skills are optional and asked about first.
-argument-hint: "[--yes] [--dry-run] [--tools-only|--project-only] [--update-sections] [--impeccable|--skip-impeccable] [--graphify-scope=user|global] [--skip-playwright]"
+argument-hint: "[--yes] [--dry-run] [--tools-only|--project-only] [--keep-sections] [--impeccable|--skip-impeccable] [--graphify-scope=user|global] [--skip-playwright]"
 allowed-tools: Bash(node:*), Read, Write, Edit, AskUserQuestion
 ---
 
@@ -28,8 +28,9 @@ Set up the Claude + Codex workflow in the current project.
    didn't pass `--yes`, list the install commands it printed and ask whether to re-run
    with `--yes`.
 3. Show the summary: what was created, merged or skipped, and the steps that need
-   attention. If a `## Workflow` or `## Codex execution` section exists but differs
-   from the plugin's, say so and offer `--update-sections`.
+   attention. Existing `## Workflow` / `## Codex execution` sections are replaced with the
+   plugin's (the old file is saved in `.codex/backup/`); mention it, and offer
+   `--keep-sections` if the user customized them. Mention any stale files it removed.
 4. Read the detected checks it printed. If they're wrong or empty, propose a
    `.codex/verify.json`, and propose `alignment.riskPaths` for the project's schema,
    migration and auth paths (see the claude-codex-workflow skill, "Checks").
